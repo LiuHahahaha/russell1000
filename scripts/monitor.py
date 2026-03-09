@@ -25,7 +25,7 @@ EMAIL_FROM     = os.environ.get("EMAIL_FROM", "")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
 EMAIL_TO       = os.environ.get("EMAIL_TO", "")
 SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT      = int(os.environ.get("SMTP_PORT", "465"))
+SMTP_PORT      = int(os.environ.get("SMTP_PORT", "") or "465")
 NEWS_API_KEY   = os.environ.get("NEWS_API_KEY", "")
 PAGES_URL      = os.environ.get("PAGES_URL", "")   # e.g. https://yourname.github.io/russell1000
 TOP_N          = 30
@@ -97,7 +97,6 @@ def get_tickers():
         print(f"  ⚠️ Wikipedia 失败: {e}")
     print(f"  ⚠️ 兜底列表: {len(FALLBACK)} 只")
     return list(dict.fromkeys(FALLBACK))
-
 
 # ── 批量拉行情 ────────────────────────────────────────────────
 def fetch_perf(tickers, batch=150):
