@@ -1,0 +1,57 @@
+name: 美股异动日报（Russell 1000）
+
+on:
+  schedule:
+    - cron: '0 22 * * 2-6'
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🐍 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 📈 运行监控脚本
+        env:
+          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+          SMTP_HOST:      ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:      ${{ secrets.SMTP_PORT }}
+          NEWS_API_KEY:   ${{ secrets.NEWS_API_KEY }}
+          PAGES_URL:      ${{ secrets.PAGES_URL }}
+        run: python scripts/monitor.py
+
+      - name: 📝 Commit & Push docs/index.html
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html
+          git diff --staged --quiet || git commit -m "📈 每日报告更新 $(date -u +'%Y-%m-%d')"
+          git push
+
+      - name: 📎 上传 HTML 备份
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-${{ github.run_id }}
+          path: docs/index.html
+          retention-days: 30
