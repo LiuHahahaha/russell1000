@@ -2,7 +2,7 @@ name: 美股异动日报（Russell 1000）
 
 on:
   schedule:
-    - cron: '0 22 * * 2-6'
+    - cron: '0 22 * * 1-5'
 
   workflow_dispatch:
 
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  generate-report:
+  generate-report
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
