@@ -108,8 +108,16 @@ def _parse_chunk(raw, chunk, vol_sum=False):
     result = []
     for t in chunk:
         try:
-            cl = raw["Close"][t].dropna() if len(chunk)>1 else raw["Close"].dropna()
-            vo = raw["Volume"][t].dropna() if len(chunk)>1 else raw["Volume"].dropna()
+            # 兼容 yfinance 多种返回结构
+            if isinstance(raw.columns, pd.MultiIndex):
+                cl = raw["Close"][t].dropna()
+                vo = raw["Volume"][t].dropna()
+            elif len(chunk) == 1:
+                cl = raw["Close"].dropna()
+                vo = raw["Volume"].dropna()
+            else:
+                cl = raw["Close"][t].dropna()
+                vo = raw["Volume"][t].dropna()
             if len(cl) < 2: continue
             p0, p1 = float(cl.iloc[0 if vol_sum else -2]), float(cl.iloc[-1])
             if p0 == 0 or p1 == 0: continue
@@ -714,9 +722,14 @@ def main():
     if not perf:
         print("❌ 未能获取任何行情数据，退出。")
         return
+    # 过滤异常数据
+    perf = [x for x in perf if abs(x["chg"]) <= 100]
+    if len(perf) < 10:
+        print(f"⚠️ 有效数据仅 {len(perf)} 只，继续生成报告...")
     perf.sort(key=lambda x: x["chg"], reverse=True)
-    gainers_raw = perf[:TOP_N]
-    losers_raw  = list(reversed(perf[-TOP_N:]))
+    n = min(TOP_N, len(perf) // 2)
+    gainers_raw = perf[:n]
+    losers_raw  = list(reversed(perf[-n:]))
     if not gainers_raw or not losers_raw:
         print("❌ 数据不足，退出。")
         return
