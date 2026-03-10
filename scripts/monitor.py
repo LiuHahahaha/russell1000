@@ -20,6 +20,7 @@ SMTP_PORT      = int(os.environ.get("SMTP_PORT", "") or "465")
 NEWS_API_KEY   = os.environ.get("NEWS_API_KEY", "")
 PAGES_URL      = os.environ.get("PAGES_URL", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY", "")
 TOP_N = 30
 
 FALLBACK = [
@@ -207,70 +208,89 @@ def fetch_news(ticker, name):
 
 _SYSTEM_PROMPT = "你是一位在华尔街工作超过15年的资深美股分析师，每天为机构客户撰写个股异动点评。你的风格特点：紧扣新闻事件和数据，绝不说空话套话，每一句都有信息增量；逻辑清晰，层层递进，善于把复杂的市场逻辑用通俗但专业的语言表达；特别擅长从新闻标题中捕捉关键信号，并结合行业知识给出有洞察力的解读；分析覆盖市场主流观点，综合多方信息源的看法，而非单一视角。"
 
+def _ai_key():
+    """优先使用 Perplexity（联网搜索），fallback 到 OpenAI"""
+    return PERPLEXITY_API_KEY or OPENAI_API_KEY
+
+def _ai_call(prompt, system=_SYSTEM_PROMPT):
+    """统一AI调用：Perplexity Sonar（联网）或 OpenAI（离线）"""
+    key = _ai_key()
+    if not key: return None
+
+    if PERPLEXITY_API_KEY:
+        # Perplexity Sonar — 自带联网搜索，会自动搜索全网信息
+        url = "https://api.perplexity.ai/chat/completions"
+        model = "sonar"
+        headers = {"Authorization": f"Bearer {PERPLEXITY_API_KEY}", "Content-Type": "application/json"}
+    else:
+        # OpenAI fallback
+        url = "https://api.openai.com/v1/chat/completions"
+        model = "gpt-4o-mini"
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+
+    try:
+        r = requests.post(url, headers=headers,
+            json={"model": model, "max_tokens": 1200, "temperature": 0.6,
+                  "messages": [{"role": "system", "content": system},
+                               {"role": "user", "content": prompt}]},
+            timeout=60)
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"    ⚠️ AI调用失败: {e}")
+        return None
+
 def gpt_analysis_daily(ticker, name, chg, sector, industry, mktcap, vol, price, news_items):
-    if not OPENAI_API_KEY: return None
+    if not _ai_key(): return None
     direction = "大涨" if chg > 0 else "大跌"
     cap_str = fmt_cap(mktcap); vol_str = fmt_vol(vol)
     news_text = ""
     for i, n in enumerate(news_items, 1):
         if "暂无最新新闻" not in n.get("text",""): news_text += f"  {i}. {n['text']} ({n['src']})\n"
     if not news_text: news_text = "  （暂无相关新闻）\n"
-    prompt = f"""请对以下股票今日的异常波动进行深度分析。
+    prompt = f"""请先搜索{name}（{ticker}）最新的新闻、财报数据、分析师评级等公开信息，然后对该股今日异动做深度分析。
 
 公司：{name}（{ticker}）| 行业：{sector} / {industry}
 市值：{cap_str} | 当前价：${price} | 涨跌幅：{'+' if chg > 0 else ''}{chg:.2f}%（{direction}）| 成交量：{vol_str}
 
-今日相关新闻：
+已知相关新闻：
 {news_text}
-请按以下结构撰写分析（总计300-450字，用中文），分四个自然段落，段落之间空一行：
+请结合你搜索到的最新信息和上面的新闻，用中文撰写深度分析（300-500字），分四段：
 
-第一段——异动核心原因（约120字）：仔细阅读上面的新闻标题，提取最关键的事件（如加入指数、财报超预期、并购、政策变化、产品发布、大额合作等），作为股价{direction}的主因展开分析。如果新闻提到了具体事件，你必须明确引用并深入解读其影响，不能忽略。如果没有明确新闻，则从公司基本面、行业供需、竞争格局等角度合理推断。
+第一段——异动核心原因（约150字）：找出最关键的事件，引用具体数据（如EPS、营收、同比增幅、分析师目标价调整等），作为股价{direction}的主因展开分析。必须引用具体新闻事件。
 
-第二段——市场环境与行业联动（约100字）：分析{sector}行业当前的整体趋势（如AI热潮、利率环境、监管政策等），以及该公司在行业链中的位置和竞争优势。如果今日有板块联动效应，请指出。
+第二段——市场环境与行业联动（约100字）：分析{sector}行业当前趋势，是否有板块联动效应。
 
-第三段——资金面与情绪解读（约80字）：从成交量{vol_str}判断资金参与程度，市值{cap_str}级别的股票出现{abs(chg):.1f}%波动意味着什么，分析机构和散户的可能态度。
+第三段——资金面与情绪解读（约80字）：从成交量{vol_str}和市值{cap_str}角度分析资金参与度和市场情绪。
 
-第四段——后市展望与风险提示（约100字）：未来关键催化剂或风险点是什么？投资者应重点关注哪些指标、事件或时间节点？给出可操作性建议。
+第四段——后市展望与风险提示（约100字）：关键催化剂或风险，具体关注什么事件和时间节点。
 
-格式要求：四个自然段落，段落之间空一行。不要输出标题、编号、bullet point、星号等格式符号。语言专业但通俗。不要编造不存在的具体数据或事件。要覆盖市场主流观点。"""
-    try:
-        r = requests.post("https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model":"gpt-4o-mini","max_tokens":1000,"temperature":0.6,
-                  "messages":[{"role":"system","content":_SYSTEM_PROMPT},{"role":"user","content":prompt}]}, timeout=45)
-        result = r.json()["choices"][0]["message"]["content"].strip()
-        print(f"    ✅ AI日报分析 ({len(result)}字)"); return result
-    except Exception as e:
-        print(f"    ⚠️ AI分析失败: {e}"); return None
+四个自然段落，段落之间空一行，不要标题、编号或bullet point。不要编造数据。"""
+    result = _ai_call(prompt)
+    if result: print(f"    ✅ AI日报分析 ({len(result)}字)")
+    return result
 
 def gpt_analysis_20d(ticker, name, chg_20d, sector, industry, price_now, price_20d_ago, date_range):
-    if not OPENAI_API_KEY: return None
+    if not _ai_key(): return None
     direction = "持续上涨" if chg_20d > 0 else "持续下跌"
-    prompt = f"""请分析以下股票过去20个交易日的趋势性行情。
+    prompt = f"""请先搜索{name}（{ticker}）最近一个月的新闻、财报、分析师评级变化等公开信息，然后分析该股过去20个交易日的趋势。
 
 公司：{name}（{ticker}）| 行业：{sector} / {industry}
-20日前股价：${price_20d_ago} → 当前：${price_now} | 累计涨跌幅：{'+' if chg_20d>0 else ''}{chg_20d:.2f}% | 区间：{date_range}
+20日前股价：${price_20d_ago} → 当前：${price_now} | 累计：{'+' if chg_20d>0 else ''}{chg_20d:.2f}% | 区间：{date_range}
 
-请按以下结构撰写趋势分析（总计300-450字，用中文），分四个自然段落，段落之间空一行：
+请结合搜索到的最新信息，用中文撰写趋势分析（300-500字），分四段：
 
-第一段——20日{direction}的核心逻辑（约120字）：从基本面（财报、营收、利润率变化）、行业政策（监管、补贴、贸易政策）、宏观环境（利率、通胀、经济数据）等多维度分析这段时间{direction}的根本原因。结合该公司最近可能发生的重大事件。
+第一段——趋势核心逻辑（约150字）：这20天{direction}的根本原因，引用具体事件和数据（财报、营收变化、政策、行业动态等）。
 
-第二段——行业趋势与竞争格局（约100字）：这20天内{sector}行业整体表现如何？行业内有哪些重大变化？该公司相比竞争对手的表现如何？在行业链中的地位是否有变化？
+第二段——关键催化剂或拖累（约100字）：区间内具体的转折事件，如财报发布、分析师评级、大股东动向、竞争格局变化等。
 
-第三段——估值与技术面判断（约80字）：经过20天的{direction}，当前股价处于什么位置？从估值角度看是否合理？从技术面看趋势是否可能延续或反转？市场对该股的一致预期是什么？
+第三段——行业对比（约80字）：同期{sector}板块表现，该股跑赢还是跑输，原因是什么。
 
-第四段——未来关键变量与风险提示（约100字）：接下来1-3个月内，有哪些关键催化剂或风险事件值得关注？投资者应该重点跟踪哪些指标？
+第四段——前瞻研判（约100字）：未来1-3周关键变量，当前价位的支撑/阻力，即将到来的重要事件。
 
-格式要求：四个自然段落，段落之间空一行。不要输出标题、编号、bullet point、星号等格式符号。语言专业但通俗。不要编造不存在的具体数据或事件。要覆盖市场主流观点。"""
-    try:
-        r = requests.post("https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-            json={"model":"gpt-4o-mini","max_tokens":1000,"temperature":0.6,
-                  "messages":[{"role":"system","content":_SYSTEM_PROMPT},{"role":"user","content":prompt}]}, timeout=45)
-        result = r.json()["choices"][0]["message"]["content"].strip()
-        print(f"    ✅ AI20日分析 ({len(result)}字)"); return result
-    except Exception as e:
-        print(f"    ⚠️ AI20日分析失败: {e}"); return None
+四个自然段落，段落之间空一行，不要标题、编号或bullet point。不要编造数据。"""
+    result = _ai_call(prompt)
+    if result: print(f"    ✅ AI20日分析 ({len(result)}字)")
+    return result
 
 def to_js(stocks):
     def e(s): return str(s).replace("\\","\\\\").replace("`","\\`").replace("${","\\${")
