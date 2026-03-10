@@ -10,11 +10,11 @@ permissions:
   contents: write
 
 jobs:
-  generate-report
+    generate-report:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
-    steps:
+   steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
         with:
