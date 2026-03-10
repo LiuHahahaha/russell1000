@@ -1,38 +1,27 @@
 #!/usr/bin/env python3
 """
-罗素1000 美股异动日报 — 完整版（AI分析增强版）
-每日盘后由 GitHub Actions 自动运行：
-1. 获取罗素1000成分股列表
-2. 批量下载当日行情，找出涨幅前30 / 跌幅前30
-3. 为每只股票抓取最新新闻标题（原因）
-4. 把新闻+行情传给AI做深度分析
-5. 把真实数据注入 HTML 模板 → docs/index.html
-6. GitHub Actions 推送到 GitHub Pages（固定网址）
-7. 同时发送邮件通知
+罗素1000 美股异动日报 — 完整版（含20日回顾）
+每日盘后由 GitHub Actions 自动运行
 """
-
 import os, json, time, re, smtplib
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-
 import yfinance as yf
 import pandas as pd
 import requests
 
-# ── 环境变量配置（GitHub Secrets）────────────────────────────
-EMAIL_FROM    = os.environ.get("EMAIL_FROM", "")
-EMAIL_PASSWORD= os.environ.get("EMAIL_PASSWORD", "")
-EMAIL_TO      = os.environ.get("EMAIL_TO", "")
-SMTP_HOST     = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT     = int(os.environ.get("SMTP_PORT", "") or "465")
-NEWS_API_KEY  = os.environ.get("NEWS_API_KEY", "")
-PAGES_URL     = os.environ.get("PAGES_URL", "")
-OPENAI_API_KEY= os.environ.get("OPENAI_API_KEY", "")
+EMAIL_FROM     = os.environ.get("EMAIL_FROM", "")
+EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
+EMAIL_TO       = os.environ.get("EMAIL_TO", "")
+SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT      = int(os.environ.get("SMTP_PORT", "") or "465")
+NEWS_API_KEY   = os.environ.get("NEWS_API_KEY", "")
+PAGES_URL      = os.environ.get("PAGES_URL", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 TOP_N = 30
 
-# ── 罗素1000成分股（兜底列表）──────────────────────────────────
 FALLBACK = [
     "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","BRK-B","JPM","UNH",
     "XOM","JNJ","V","PG","MA","AVGO","HD","CVX","MRK","ABBV","LLY","PEP",
@@ -49,11 +38,12 @@ FALLBACK = [
     "MPC","VLO","OXY","SLB","HAL","DIS","CMCSA","T","VZ","TMUS","ORCL",
     "NOW","WDAY","HUBS","ADP","PAYX","ROP","CDNS","SNPS","ANET","MRVL",
     "KLAC","LRCX","AMAT","APP","TTD","AXON","DELL","HPE","NTAP",
-    "CMG","YUM","DPZ","WING","CAVA","DRI","TGT","TJX","ROST","BURL",
+    "CMG","YUM","DPZ","WING","CAVA","DRI","TJX","ROST","BURL",
     "ORLY","AZO","KMX","AN","APD","ECL","LYB","PPG","DKNG","MGM","LVS",
     "CELH","MNST","KDP","AMG","TROW","STT","BK","NTRS","RJF","CBOE",
 ]
 
+# ────────────────────────────────────────────────
 def get_tickers():
     print("📋 获取罗素1000成分股...")
     try:
@@ -80,10 +70,10 @@ def get_tickers():
     print(f"  ⚠️ 兜底列表: {len(FALLBACK)} 只")
     return list(dict.fromkeys(FALLBACK))
 
-
-# ── 批量拉行情（核心修复版）─────────────────────────────────────
+# ────────────────────────────────────────────────
 def fetch_perf(tickers, batch=100):
-    print(f"\n📊 下载行情 ({len(tickers)} 只)...")
+    """今日涨跌幅"""
+    print(f"\n📊 下载今日行情 ({len(tickers)} 只)...")
     out = []
     groups = [tickers[i:i+batch] for i in range(0, len(tickers), batch)]
     for gi, chunk in enumerate(groups):
@@ -91,76 +81,119 @@ def fetch_perf(tickers, batch=100):
             raw = yf.download(chunk, period="5d", interval="1d",
                               auto_adjust=True, progress=False, threads=True)
             if raw.empty:
-                raise ValueError("empty dataframe")
+                raise ValueError("empty")
             if len(chunk) == 1:
                 t = chunk[0]
-                try:
-                    cl = raw["Close"].dropna()
-                    vo = raw["Volume"].dropna()
-                    if len(cl) >= 2:
-                        p0, p1 = float(cl.iloc[-2]), float(cl.iloc[-1])
-                        if p0 > 0 and p1 > 0:
-                            out.append({"ticker": t, "price": round(p1, 2),
-                                        "prev": round(p0, 2),
-                                        "chg": round((p1-p0)/p0*100, 2),
-                                        "vol": int(vo.iloc[-1]) if len(vo) else 0})
-                except Exception as e:
-                    pass
+                cl = raw["Close"].dropna(); vo = raw["Volume"].dropna()
+                if len(cl) >= 2:
+                    p0, p1 = float(cl.iloc[-2]), float(cl.iloc[-1])
+                    if p0 > 0 and p1 > 0:
+                        out.append({"ticker":t,"price":round(p1,2),"prev":round(p0,2),
+                                    "chg":round((p1-p0)/p0*100,2),
+                                    "vol":int(vo.iloc[-1]) if len(vo) else 0})
             else:
-                close_df = raw["Close"] if "Close" in raw.columns.get_level_values(0) else None
-                vol_df   = raw["Volume"] if "Volume" in raw.columns.get_level_values(0) else None
-                if close_df is None:
-                    raise ValueError("no Close column")
+                close_df = raw["Close"]; vol_df = raw["Volume"]
                 for t in chunk:
                     try:
-                        if t not in close_df.columns:
-                            continue
+                        if t not in close_df.columns: continue
                         cl = close_df[t].dropna()
-                        vo = vol_df[t].dropna() if vol_df is not None and t in vol_df.columns else pd.Series()
+                        vo = vol_df[t].dropna() if t in vol_df.columns else pd.Series(dtype=float)
                         if len(cl) >= 2:
                             p0, p1 = float(cl.iloc[-2]), float(cl.iloc[-1])
                             if p0 > 0 and p1 > 0:
-                                out.append({"ticker": t, "price": round(p1, 2),
-                                            "prev": round(p0, 2),
-                                            "chg": round((p1-p0)/p0*100, 2),
-                                            "vol": int(vo.iloc[-1]) if len(vo) else 0})
-                    except:
-                        pass
+                                out.append({"ticker":t,"price":round(p1,2),"prev":round(p0,2),
+                                            "chg":round((p1-p0)/p0*100,2),
+                                            "vol":int(vo.iloc[-1]) if len(vo) else 0})
+                    except: pass
         except Exception as e:
-            print(f"  ⚠️ batch {gi+1} 批量下载失败: {e}")
-        print(f"  batch {gi+1}/{len(groups)} 完成 → 累计 {len(out)} 只")
+            print(f"  batch {gi+1} error: {e}")
+        print(f"  batch {gi+1}/{len(groups)} → 累计 {len(out)} 只")
         time.sleep(0.3)
 
     if len(out) < 20:
-        print(f"  ⚠️ 批量下载仅得到 {len(out)} 只，改用逐只下载...")
+        print(f"  ⚠️ 批量不足，逐只下载...")
         out2 = []
         for i, t in enumerate(tickers):
             try:
                 hist = yf.Ticker(t).history(period="5d", interval="1d", auto_adjust=True)
                 if len(hist) >= 2:
-                    p0 = float(hist["Close"].iloc[-2])
-                    p1 = float(hist["Close"].iloc[-1])
+                    p0, p1 = float(hist["Close"].iloc[-2]), float(hist["Close"].iloc[-1])
                     if p0 > 0 and p1 > 0:
                         vol = int(hist["Volume"].iloc[-1]) if "Volume" in hist.columns else 0
-                        out2.append({"ticker": t, "price": round(p1, 2),
-                                     "prev": round(p0, 2),
-                                     "chg": round((p1-p0)/p0*100, 2),
-                                     "vol": vol})
-            except:
-                pass
+                        out2.append({"ticker":t,"price":round(p1,2),"prev":round(p0,2),
+                                     "chg":round((p1-p0)/p0*100,2),"vol":vol})
+            except: pass
             if i % 100 == 99:
-                print(f"  逐只进度: {i+1}/{len(tickers)}")
+                print(f"  逐只: {i+1}/{len(tickers)}")
                 time.sleep(1)
-        if len(out2) > len(out):
-            out = out2
+        if len(out2) > len(out): out = out2
     return out
 
+# ────────────────────────────────────────────────
+def fetch_perf_20d(tickers, batch=100):
+    """过去20个交易日累计涨跌幅"""
+    print(f"\n📅 下载20日行情 ({len(tickers)} 只)...")
+    out = []
+    groups = [tickers[i:i+batch] for i in range(0, len(tickers), batch)]
+    for gi, chunk in enumerate(groups):
+        try:
+            # 用 1mo 确保覆盖20个交易日
+            raw = yf.download(chunk, period="1mo", interval="1d",
+                              auto_adjust=True, progress=False, threads=True)
+            if raw.empty:
+                raise ValueError("empty")
+            if len(chunk) == 1:
+                t = chunk[0]
+                cl = raw["Close"].dropna()
+                if len(cl) >= 20:
+                    p0, p1 = float(cl.iloc[-20]), float(cl.iloc[-1])
+                    if p0 > 0 and p1 > 0:
+                        # 计算每日收盘价列表（用于迷你图）
+                        prices = [round(float(x), 2) for x in cl.iloc[-20:].tolist()]
+                        out.append({"ticker":t,"price":round(p1,2),"price_20d_ago":round(p0,2),
+                                    "chg_20d":round((p1-p0)/p0*100,2),"prices":prices})
+            else:
+                close_df = raw["Close"]
+                for t in chunk:
+                    try:
+                        if t not in close_df.columns: continue
+                        cl = close_df[t].dropna()
+                        if len(cl) >= 20:
+                            p0, p1 = float(cl.iloc[-20]), float(cl.iloc[-1])
+                            if p0 > 0 and p1 > 0:
+                                prices = [round(float(x), 2) for x in cl.iloc[-20:].tolist()]
+                                out.append({"ticker":t,"price":round(p1,2),"price_20d_ago":round(p0,2),
+                                            "chg_20d":round((p1-p0)/p0*100,2),"prices":prices})
+                    except: pass
+        except Exception as e:
+            print(f"  20d batch {gi+1} error: {e}")
+        print(f"  batch {gi+1}/{len(groups)} → 累计 {len(out)} 只")
+        time.sleep(0.3)
 
-# ── 公司基本信息 ─────────────────────────────────────────────
+    if len(out) < 20:
+        print("  ⚠️ 20d逐只下载...")
+        out2 = []
+        for i, t in enumerate(tickers):
+            try:
+                hist = yf.Ticker(t).history(period="1mo", interval="1d", auto_adjust=True)
+                cl = hist["Close"].dropna()
+                if len(cl) >= 20:
+                    p0, p1 = float(cl.iloc[-20]), float(cl.iloc[-1])
+                    if p0 > 0 and p1 > 0:
+                        prices = [round(float(x),2) for x in cl.iloc[-20:].tolist()]
+                        out2.append({"ticker":t,"price":round(p1,2),"price_20d_ago":round(p0,2),
+                                     "chg_20d":round((p1-p0)/p0*100,2),"prices":prices})
+            except: pass
+            if i % 100 == 99:
+                print(f"  逐只20d: {i+1}/{len(tickers)}")
+                time.sleep(1)
+        if len(out2) > len(out): out = out2
+    return out
+
+# ────────────────────────────────────────────────
 _info_cache = {}
 def get_info(ticker):
-    if ticker in _info_cache:
-        return _info_cache[ticker]
+    if ticker in _info_cache: return _info_cache[ticker]
     try:
         d = yf.Ticker(ticker).info
         r = {"name": d.get("longName") or d.get("shortName") or ticker,
@@ -175,7 +208,7 @@ def get_info(ticker):
 def fmt_cap(n):
     if not n: return "N/A"
     if n>=1e12: return f"${n/1e12:.2f}T"
-    if n>=1e9: return f"${n/1e9:.1f}B"
+    if n>=1e9:  return f"${n/1e9:.1f}B"
     return f"${n/1e6:.0f}M"
 
 def fmt_vol(v):
@@ -185,16 +218,14 @@ def fmt_vol(v):
     if v>=1e3: return f"{v/1e3:.0f}K"
     return str(v)
 
-
-# ── 抓新闻 ───────────────────────────────────────────────────
+# ────────────────────────────────────────────────
 def fetch_news(ticker, name):
     items = []
     if NEWS_API_KEY:
         try:
             p = {"q": f'"{ticker}" stock',
                  "from": (datetime.utcnow()-timedelta(days=2)).strftime("%Y-%m-%d"),
-                 "sortBy":"relevancy","pageSize":5,"language":"en",
-                 "apiKey":NEWS_API_KEY}
+                 "sortBy":"relevancy","pageSize":5,"language":"en","apiKey":NEWS_API_KEY}
             r = requests.get("https://newsapi.org/v2/everything", params=p, timeout=10)
             for a in r.json().get("articles",[])[:5]:
                 t = (a.get("title") or "").strip()
@@ -202,8 +233,7 @@ def fetch_news(ticker, name):
                 d = (a.get("publishedAt") or "")[:10]
                 if t and "[Removed]" not in t:
                     items.append({"text":t,"src":f"{s} · {d}"})
-        except:
-            pass
+        except: pass
     if not items:
         try:
             url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
@@ -212,87 +242,89 @@ def fetch_news(ticker, name):
             for item in root.findall(".//item")[:5]:
                 t = (item.findtext("title") or "").strip()
                 pub = (item.findtext("pubDate") or "")[:16]
-                if t:
-                    items.append({"text":t,"src":f"Yahoo Finance · {pub}"})
-        except:
-            pass
+                if t: items.append({"text":t,"src":f"Yahoo Finance · {pub}"})
+        except: pass
     if not items:
         items = [{"text":"暂无最新新闻，可能为技术性波动或市场整体情绪驱动","src":"—"}]
     return items[:5]
 
-
-# ══════════════════════════════════════════════════════════════
-# ── GPT AI 深度分析（增强版）─────────────────────────────────
-# ══════════════════════════════════════════════════════════════
-def gpt_analysis(ticker, name, chg, sector, industry, mktcap, vol, price, news_items):
-    """用 GPT-4o-mini 生成中文股票异动深度分析，结合新闻内容"""
-    if not OPENAI_API_KEY:
-        return None
-
+# ────────────────────────────────────────────────
+def gpt_analysis_daily(ticker, name, chg, sector, industry, mktcap, vol, price, news_items):
+    """今日异动 GPT 分析"""
+    if not OPENAI_API_KEY: return None
     direction = "大涨" if chg > 0 else "大跌"
-    cap_str = fmt_cap(mktcap)
-    vol_str = fmt_vol(vol)
-
-    # 把抓到的新闻标题整理成文本，传给AI参考
-    news_text = ""
-    for i, n in enumerate(news_items, 1):
-        if n["text"] != "暂无最新新闻，可能为技术性波动或市场整体情绪驱动":
-            news_text += f"  {i}. {n['text']} ({n['src']})\n"
-
-    if not news_text:
-        news_text = "  （暂无相关新闻）\n"
-
-    prompt = f"""你是一位资深的美股分析师，擅长解读股价异动原因。请根据以下信息，对这只股票今日的异常波动进行深度分析。
+    news_text = "\n".join(
+        f" {i}. {n['text']} ({n['src']})"
+        for i, n in enumerate(news_items, 1)
+        if n["text"] != "暂无最新新闻，可能为技术性波动或市场整体情绪驱动"
+    ) or "（暂无相关新闻）"
+    prompt = f"""你是资深美股分析师。请对以下股票今日异动做深度分析。
 
 【股票信息】
 - 公司：{name}（{ticker}）
 - 行业：{sector} / {industry}
-- 市值：{cap_str}
-- 当前价：${price}
-- 今日涨跌幅：{'+' if chg > 0 else ''}{chg:.2f}%
-- 成交量：{vol_str}
+- 市值：{fmt_cap(mktcap)}，当前价：${price}
+- 今日涨跌幅：{'+' if chg>0 else ''}{chg:.2f}%，成交量：{fmt_vol(vol)}
 
-【今日相关新闻标题】
+【今日相关新闻】
 {news_text}
-【分析要求】
-请用中文撰写一段详细的异动分析（150-250字），包含以下要素：
-1. 核心驱动因素：结合上面的新闻标题，分析最可能导致{direction}的直接原因
-2. 行业背景：当前{sector}行业的大环境如何影响该股
-3. 资金面解读：从成交量和市值角度分析市场情绪
-4. 后续关注点：投资者接下来应关注什么催化剂或风险
 
-要求：
-- 分析要具体、有深度，不要泛泛而谈
-- 如果新闻标题中有明确的事件（如财报、收购、产品发布、指数调整等），务必作为核心原因展开分析
-- 如果没有明确新闻，则基于行业逻辑和市场环境合理推断
-- 不要使用编号或列表格式，用自然流畅的段落表达
-- 不要加标题或前缀，直接输出分析内容"""
-
+请用中文写一段深度分析（150-250字），涵盖：①核心驱动因素（结合新闻）②行业背景 ③资金面解读 ④后续关注点。
+直接输出分析内容，不要标题或编号列表。"""
     try:
         r = requests.post(
             "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
-                     "Content-Type": "application/json"},
-            json={
-                "model": "gpt-4o-mini",
-                "max_tokens": 600,
-                "temperature": 0.7,
-                "messages": [
-                    {"role": "system", "content": "你是一位专业的美股市场分析师，擅长结合新闻事件、行业趋势和资金面数据来解读个股异动。你的分析风格专业但通俗易懂，善于抓住核心逻辑。"},
-                    {"role": "user", "content": prompt}
-                ]
-            },
-            timeout=30
-        )
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model":"gpt-4o-mini","max_tokens":600,"temperature":0.7,
+                  "messages":[
+                      {"role":"system","content":"你是专业美股市场分析师，擅长结合新闻和行业趋势解读个股异动。"},
+                      {"role":"user","content":prompt}]},
+            timeout=30)
         result = r.json()["choices"][0]["message"]["content"].strip()
-        print(f"    ✅ AI分析完成 ({len(result)} 字)")
+        print(f"  ✅ AI日报分析 ({len(result)}字)")
         return result
     except Exception as e:
-        print(f"    ⚠️ AI分析失败: {e}")
+        print(f"  ⚠️ AI分析失败: {e}")
         return None
 
+def gpt_analysis_20d(ticker, name, chg_20d, sector, industry, price_now, price_20d_ago, date_range):
+    """20日趋势 GPT 分析"""
+    if not OPENAI_API_KEY: return None
+    direction = "持续上涨" if chg_20d > 0 else "持续下跌"
+    prompt = f"""你是资深美股分析师。请分析以下股票过去20个交易日的趋势性行情。
 
-# ── 数据序列化为 JS ──────────────────────────────────────────
+【股票信息】
+- 公司：{name}（{ticker}）
+- 行业：{sector} / {industry}
+- 20日前股价：${price_20d_ago} → 当前：${price_now}
+- 20个交易日累计涨跌幅：{'+' if chg_20d>0 else ''}{chg_20d:.2f}%
+- 分析区间：{date_range}
+
+请用中文写一段趋势分析（200-300字），涵盖：
+①这20天{direction}的核心逻辑（基本面、行业政策、宏观环境等）
+②关键催化剂或拖累因素（可能的财报、产品发布、监管、竞争格局变化等）
+③这段时间行业整体表现对该股的影响
+④当前估值或技术面所处位置的简要判断
+⑤未来值得关注的关键变量
+
+直接输出分析内容，自然段落，不要标题或编号列表。"""
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={"model":"gpt-4o-mini","max_tokens":800,"temperature":0.7,
+                  "messages":[
+                      {"role":"system","content":"你是专业美股市场分析师，擅长从基本面、行业、宏观角度分析股票中期趋势。"},
+                      {"role":"user","content":prompt}]},
+            timeout=30)
+        result = r.json()["choices"][0]["message"]["content"].strip()
+        print(f"  ✅ AI20日分析 ({len(result)}字)")
+        return result
+    except Exception as e:
+        print(f"  ⚠️ AI20日分析失败: {e}")
+        return None
+
+# ────────────────────────────────────────────────
 def to_js(stocks):
     def e(s):
         return str(s).replace("\\","\\\\").replace("`","\\`").replace("${","\\${")
@@ -300,8 +332,8 @@ def to_js(stocks):
     for s in stocks:
         news = "[" + ",".join(
             "{text:`"+e(n["text"])+"`,src:`"+e(n["src"])+"`}"
-            for n in s["news"]) + "]"
-        ai = ("`" + e(s.get("ai","")) + "`") if s.get("ai") else "null"
+            for n in s.get("news",[])) + "]"
+        ai   = ("`"+e(s.get("ai",""))+"`") if s.get("ai") else "null"
         rows.append(
             "{rank:"+str(s["rank"])
             +",ticker:`"+e(s["ticker"])+"`"
@@ -309,19 +341,42 @@ def to_js(stocks):
             +",sector:`"+e(s["info"]["sector"])+"`"
             +",industry:`"+e(s["info"]["industry"])+"`"
             +",price:"+str(s["price"])
-            +",prev:"+str(s["prev"])
+            +",prev:"+str(s.get("prev",s["price"]))
             +",chg:"+str(s["chg"])
-            +",vol:`"+e(fmt_vol(s["vol"]))+"`"
+            +",vol:`"+e(fmt_vol(s.get("vol",0)))+"`"
             +",mktcap:`"+e(fmt_cap(s["info"]["mktcap"]))+"`"
             +",ai:"+ai
             +",news:"+news+"}")
     return "[\n"+",\n".join(rows)+"\n]"
 
+def to_js_20d(stocks):
+    def e(s):
+        return str(s).replace("\\","\\\\").replace("`","\\`").replace("${","\\${")
+    rows = []
+    for s in stocks:
+        ai20 = ("`"+e(s.get("ai20",""))+"`") if s.get("ai20") else "null"
+        prices_js = "[" + ",".join(str(p) for p in s.get("prices",[])) + "]"
+        rows.append(
+            "{rank:"+str(s["rank"])
+            +",ticker:`"+e(s["ticker"])+"`"
+            +",name:`"+e(s["info"]["name"])+"`"
+            +",sector:`"+e(s["info"]["sector"])+"`"
+            +",industry:`"+e(s["info"]["industry"])+"`"
+            +",price:"+str(s["price"])
+            +",price20ago:"+str(s["price_20d_ago"])
+            +",chg20:"+str(s["chg_20d"])
+            +",mktcap:`"+e(fmt_cap(s["info"]["mktcap"]))+"`"
+            +",prices:"+prices_js
+            +",ai20:"+ai20+"}")
+    return "[\n"+",\n".join(rows)+"\n]"
 
-# ── 生成 HTML ────────────────────────────────────────────────
-def build_html(gainers, losers, report_date, generated_at, total):
-    gjs = to_js(gainers)
-    ljs = to_js(losers)
+# ────────────────────────────────────────────────
+def build_html(gainers, losers, gainers_20d, losers_20d,
+               report_date, generated_at, total, date_range_20d):
+    gjs   = to_js(gainers)
+    ljs   = to_js(losers)
+    g20js = to_js_20d(gainers_20d)
+    l20js = to_js_20d(losers_20d)
     share = f'<a href="{PAGES_URL}" style="color:var(--blue)">{PAGES_URL}</a>' if PAGES_URL else "GitHub Pages"
 
     return """<!DOCTYPE html>
@@ -333,17 +388,19 @@ def build_html(gainers, losers, report_date, generated_at, total):
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#080b0f;--surface:#0e1318;--surface2:#141a22;--border:#1e2830;--border2:#263040;
---text:#d4dde8;--muted:#5a6a7a;--dim:#3a4a5a;--green:#00e5a0;--green2:#00b87a;
---red:#ff3d5a;--amber:#ffb830;--blue:#3d9eff;
+--text:#d4dde8;--muted:#5a6a7a;--dim:#3a4a5a;--green:#00e5a0;--red:#ff3d5a;
+--amber:#ffb830;--blue:#3d9eff;--purple:#a78bfa;
 --mono:'Space Mono',monospace;--sans:'DM Sans',sans-serif;}
 *{margin:0;padding:0;box-sizing:border-box;}
 body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13px;line-height:1.5;}
+/* ── topbar ── */
 .topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:0 24px;height:48px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;}
 .logo{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--green);letter-spacing:2px;}
 .tag{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:1.5px;border:1px solid var(--border2);padding:2px 8px;border-radius:2px;}
 .dot{width:6px;height:6px;border-radius:50%;background:var(--amber);box-shadow:0 0 8px var(--amber);display:inline-block;margin-right:6px;animation:blink 2s infinite;}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 .ts{font-family:var(--mono);font-size:10px;color:var(--muted);}
+/* ── hero ── */
 .hero{padding:28px 24px 0;display:grid;grid-template-columns:1fr auto;gap:24px;align-items:end;max-width:1400px;margin:0 auto;}
 .eyebrow{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:3px;text-transform:uppercase;margin-bottom:6px;}
 .hero-date{font-size:26px;font-weight:300;letter-spacing:-.5px;}
@@ -353,24 +410,32 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .stat:first-child{border-radius:6px 0 0 6px;}.stat:last-child{border-radius:0 6px 6px 0;}
 .stat-val{font-family:var(--mono);font-size:20px;font-weight:700;display:block;}
 .stat-lbl{font-size:10px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin-top:2px;display:block;}
-.tabs{max-width:1400px;margin:22px auto 0;padding:0 24px;display:flex;border-bottom:1px solid var(--border);}
-.tab{padding:10px 20px;font-family:var(--mono);font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;transition:all .2s;user-select:none;position:relative;bottom:-1px;}
+/* ── tabs ── */
+.tabs{max-width:1400px;margin:22px auto 0;padding:0 24px;display:flex;border-bottom:1px solid var(--border);overflow-x:auto;}
+.tab{padding:10px 20px;font-family:var(--mono);font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;transition:all .2s;user-select:none;position:relative;bottom:-1px;white-space:nowrap;}
 .tab:hover{color:var(--text);}
 .tab.ga.on{color:var(--green);border-bottom-color:var(--green);}
 .tab.lo.on{color:var(--red);border-bottom-color:var(--red);}
 .tab.ov.on{color:var(--blue);border-bottom-color:var(--blue);}
+.tab.g20.on{color:var(--amber);border-bottom-color:var(--amber);}
+.tab.l20.on{color:var(--purple);border-bottom-color:var(--purple);}
 .badge{display:inline-block;margin-left:6px;font-size:9px;padding:1px 5px;border-radius:2px;vertical-align:middle;}
 .ga .badge{background:rgba(0,229,160,.15);color:var(--green);}
 .lo .badge{background:rgba(255,61,90,.15);color:var(--red);}
 .ov .badge{background:rgba(61,158,255,.15);color:var(--blue);}
+.g20 .badge{background:rgba(255,184,48,.15);color:var(--amber);}
+.l20 .badge{background:rgba(167,139,250,.15);color:var(--purple);}
+/* ── main ── */
 .main{max-width:1400px;margin:0 auto;padding:20px 24px 60px;}
 .panel{display:none;}.panel.on{display:block;}
+/* ── filter bar ── */
 .fbar{display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap;}
 .sw{position:relative;}
 .sw::before{content:'⌕';position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:14px;pointer-events:none;}
 .fi{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 12px 6px 28px;font-family:var(--sans);font-size:12px;border-radius:4px;outline:none;width:175px;}
 .chip{background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:4px 10px;font-size:10px;border-radius:3px;cursor:pointer;transition:all .2s;user-select:none;font-family:var(--mono);}
 .chip:hover,.chip.on{border-color:var(--border2);color:var(--text);background:var(--surface2);}
+/* ── table ── */
 .tw{overflow-x:auto;}
 table{width:100%;border-collapse:collapse;font-size:12px;}
 thead th{background:var(--surface);border-bottom:1px solid var(--border);padding:7px 10px;text-align:left;font-family:var(--mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);white-space:nowrap;position:sticky;top:48px;cursor:pointer;user-select:none;}
@@ -390,34 +455,48 @@ tbody td{padding:9px 10px;vertical-align:middle;white-space:nowrap;}
 .pv{font-family:var(--mono);font-size:11px;color:var(--muted);}
 .cc{font-family:var(--mono);font-size:13px;font-weight:700;}
 .cc.p{color:var(--green);}.cc.n{color:var(--red);}
+.cc.pa{color:var(--amber);}.cc.na{color:var(--purple);}
 .bb{height:3px;background:var(--border);border-radius:2px;width:56px;}
 .bf{height:100%;border-radius:2px;}
 .vc,.mc{font-family:var(--mono);font-size:11px;color:var(--muted);}
+/* ── detail panel ── */
 .nr td{padding:0!important;border-bottom:1px solid var(--border2)!important;}
-.np{padding:14px 58px 18px;background:var(--surface);border-left:2px solid var(--border2);}
+.np{padding:16px 58px 20px;background:var(--surface);border-left:2px solid var(--border2);}
 .nh{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:10px;display:flex;align-items:center;gap:8px;}
 .nh::after{content:'';flex:1;height:1px;background:var(--border);}
-.ai-box{background:rgba(61,158,255,.07);border:1px solid rgba(61,158,255,.2);border-radius:4px;padding:14px 18px;margin-bottom:14px;font-size:13px;color:var(--text);line-height:1.85;}
-.ai-label{font-family:var(--mono);font-size:9px;color:var(--blue);letter-spacing:1px;margin-bottom:6px;display:flex;align-items:center;gap:6px;}
-.ai-label::after{content:'';flex:1;height:1px;background:rgba(61,158,255,.15);}
+/* AI box */
+.ai-box{border-radius:4px;padding:14px 18px;margin-bottom:14px;font-size:13px;color:var(--text);line-height:1.85;}
+.ai-box.daily{background:rgba(61,158,255,.07);border:1px solid rgba(61,158,255,.2);}
+.ai-box.trend{background:rgba(167,139,250,.07);border:1px solid rgba(167,139,250,.2);}
+.ai-label{font-family:var(--mono);font-size:9px;letter-spacing:1px;margin-bottom:6px;display:flex;align-items:center;gap:6px;}
+.ai-label.daily{color:var(--blue);}
+.ai-label.trend{color:var(--purple);}
+.ai-label::after{content:'';flex:1;height:1px;}
+.ai-label.daily::after{background:rgba(61,158,255,.15);}
+.ai-label.trend::after{background:rgba(167,139,250,.15);}
+/* news */
 .ni{display:flex;gap:10px;padding:6px 0;border-bottom:1px solid rgba(30,40,48,.4);align-items:flex-start;}
 .ni:last-child{border-bottom:none;}
 .nd{width:4px;height:4px;border-radius:50%;margin-top:7px;flex-shrink:0;}
 .nt{font-size:12px;color:var(--text);line-height:1.65;}
 .ns{font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:2px;}
+/* sparkline canvas */
+.spark-wrap{display:flex;align-items:center;}
+canvas.spark{display:block;}
+/* sector pills */
 .Technology{background:rgba(61,158,255,.12);color:#3d9eff;}
 .Communications,.Communication-Services{background:rgba(200,100,200,.12);color:#c864c8;}
 .Financial-Services,.Finance{background:rgba(255,184,48,.12);color:#ffb830;}
 .Healthcare,.Health-Care{background:rgba(0,229,160,.10);color:#00c896;}
 .Energy{background:rgba(255,140,0,.10);color:#ff8c00;}
-.Consumer-Discretionary{background:rgba(180,120,255,.10);color:#b478ff;}
+.Consumer-Discretionary,.Consumer-Cyclical{background:rgba(180,120,255,.10);color:#b478ff;}
 .Consumer-Staples{background:rgba(220,160,80,.10);color:#dca050;}
-.Consumer-Cyclical{background:rgba(180,120,255,.10);color:#b478ff;}
 .Industrials{background:rgba(90,160,160,.10);color:#5aa0a0;}
 .Real-Estate{background:rgba(255,100,80,.10);color:#ff6450;}
 .Materials,.Basic-Materials{background:rgba(100,200,100,.10);color:#64c864;}
 .Utilities{background:rgba(200,180,100,.10);color:#c8b464;}
 .Other{background:rgba(100,100,100,.10);color:#888;}
+/* overview */
 .og{display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));gap:12px;}
 .oc{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px;}
 .oh{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;}
@@ -427,6 +506,11 @@ tbody td{padding:9px 10px;vertical-align:middle;white-space:nowrap;}
 .ot{font-family:var(--mono);font-size:11px;font-weight:700;color:#fff;width:50px;flex-shrink:0;}
 .on2{font-size:11px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 6px;}
 .oc2{font-family:var(--mono);font-size:12px;font-weight:700;width:58px;text-align:right;flex-shrink:0;}
+/* 20d header strip */
+.strip-20d{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px 18px;margin-bottom:16px;display:flex;align-items:center;gap:16px;flex-wrap:wrap;}
+.strip-label{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:1.5px;}
+.strip-val{font-family:var(--mono);font-size:12px;color:var(--text);}
+/* footer */
 .footer{background:var(--surface);border-top:1px solid var(--border);padding:14px 24px;text-align:center;font-family:var(--mono);font-size:10px;color:var(--dim);line-height:1.9;}
 ::-webkit-scrollbar{width:5px;height:5px;}
 ::-webkit-scrollbar-track{background:var(--bg);}
@@ -439,143 +523,449 @@ tbody td{padding:9px 10px;vertical-align:middle;white-space:nowrap;}
   <div style="display:flex;align-items:center;gap:12px">
     <span class="logo">MKTSCAN</span>
     <span class="tag">RUSSELL 1000</span>
-    <span class="tag" style="color:var(--amber)">DAILY REPORT</span>
+    <span class="tag" style="color:var(--amber)">DAILY + 20D</span>
   </div>
   <div style="display:flex;align-items:center;gap:14px">
     <span><span class="dot"></span><span class="ts">盘后数据 · """ + report_date + """</span></span>
     <span class="ts" id="lt"></span>
   </div>
 </div>
+
 <div class="hero">
   <div>
     <div class="eyebrow">Russell 1000 · Daily Market Intelligence</div>
     <div class="hero-date"><strong>""" + report_date + """</strong> 美股异动日报</div>
     <div style="margin-top:8px;font-size:12px;color:var(--muted)">
-      扫描 <span style="color:var(--text)">""" + str(total) + """</span> 只成分股 · 生成于 <span style="color:var(--text)">""" + generated_at + """ UTC</span>（每日盘后自动更新）
+      扫描 <span style="color:var(--text)">""" + str(total) + """</span> 只成分股 ·
+      生成于 <span style="color:var(--text)">""" + generated_at + """ UTC</span>（每日盘后自动更新）
     </div>
   </div>
   <div class="stats">
-    <div class="stat"><span class="stat-val" style="color:var(--green)">↑ """ + str(TOP_N) + """</span><span class="stat-lbl">涨幅榜</span></div>
-    <div class="stat"><span class="stat-val" style="color:var(--red)">↓ """ + str(TOP_N) + """</span><span class="stat-lbl">跌幅榜</span></div>
+    <div class="stat"><span class="stat-val" style="color:var(--green)">↑ """ + str(TOP_N) + """</span><span class="stat-lbl">今日涨</span></div>
+    <div class="stat"><span class="stat-val" style="color:var(--red)">↓ """ + str(TOP_N) + """</span><span class="stat-lbl">今日跌</span></div>
+    <div class="stat"><span class="stat-val" style="color:var(--amber)">20D</span><span class="stat-lbl">回顾</span></div>
     <div class="stat"><span class="stat-val" style="color:var(--muted)">""" + str(total) + """</span><span class="stat-lbl">已扫描</span></div>
   </div>
 </div>
+
 <div class="tabs">
-  <div class="tab ga on" onclick="sw('gainers',this)">涨幅榜 <span class="badge">TOP """ + str(TOP_N) + """</span></div>
-  <div class="tab lo" onclick="sw('losers',this)" >跌幅榜 <span class="badge">TOP """ + str(TOP_N) + """</span></div>
-  <div class="tab ov" onclick="sw('overview',this)">行业总览</div>
+  <div class="tab ga on"  onclick="sw('gainers',this)">今日涨幅 <span class="badge">TOP """ + str(TOP_N) + """</span></div>
+  <div class="tab lo"     onclick="sw('losers',this)">今日跌幅 <span class="badge">TOP """ + str(TOP_N) + """</span></div>
+  <div class="tab ov"     onclick="sw('overview',this)">行业总览</div>
+  <div class="tab g20"    onclick="sw('gain20',this)">20日涨幅 <span class="badge">TOP """ + str(TOP_N) + """</span></div>
+  <div class="tab l20"    onclick="sw('lose20',this)">20日跌幅 <span class="badge">TOP """ + str(TOP_N) + """</span></div>
 </div>
+
 <div class="main">
+
+  <!-- 今日涨幅 -->
   <div class="panel on" id="p-gainers">
     <div class="fbar" id="fb-gainers"></div>
     <div class="tw"><table id="t-gainers">
       <thead><tr>
         <th>#</th><th onclick="srt('gainers','ticker')">代码</th><th>公司名称</th><th>行业</th>
         <th onclick="srt('gainers','price')">现价</th><th onclick="srt('gainers','prev')">昨收</th>
-        <th id="th-gainers-chg" class="sd" onclick="srt('gainers','chg')">涨跌幅</th>
+        <th id="th-gainers-chg" class="sd" onclick="srt('gainers','chg')">今日涨跌</th>
         <th>幅度</th><th>成交量</th><th>市值</th><th></th>
       </tr></thead>
       <tbody id="b-gainers"></tbody>
     </table></div>
   </div>
+
+  <!-- 今日跌幅 -->
   <div class="panel" id="p-losers">
     <div class="fbar" id="fb-losers"></div>
     <div class="tw"><table id="t-losers">
       <thead><tr>
         <th>#</th><th onclick="srt('losers','ticker')">代码</th><th>公司名称</th><th>行业</th>
         <th onclick="srt('losers','price')">现价</th><th onclick="srt('losers','prev')">昨收</th>
-        <th id="th-losers-chg" class="sa" onclick="srt('losers','chg')">涨跌幅</th>
+        <th id="th-losers-chg" class="sa" onclick="srt('losers','chg')">今日涨跌</th>
         <th>幅度</th><th>成交量</th><th>市值</th><th></th>
       </tr></thead>
       <tbody id="b-losers"></tbody>
     </table></div>
   </div>
+
+  <!-- 行业总览 -->
   <div class="panel" id="p-overview">
     <div class="og" id="ov-grid"></div>
   </div>
+
+  <!-- 20日涨幅 -->
+  <div class="panel" id="p-gain20">
+    <div class="strip-20d">
+      <span class="strip-label">📅 统计区间</span>
+      <span class="strip-val">""" + date_range_20d + """（过去20个交易日）</span>
+      <span class="strip-label" style="margin-left:12px">🤖 含 AI 趋势深度分析</span>
+    </div>
+    <div class="fbar" id="fb-gain20"></div>
+    <div class="tw"><table id="t-gain20">
+      <thead><tr>
+        <th>#</th><th onclick="srt20('gain20','ticker')">代码</th><th>公司名称</th><th>行业</th>
+        <th onclick="srt20('gain20','price20ago')">20日前</th>
+        <th onclick="srt20('gain20','price')">当前价</th>
+        <th id="th-gain20-chg20" class="sd" onclick="srt20('gain20','chg20')">20日涨跌</th>
+        <th>走势图</th><th>市值</th><th></th>
+      </tr></thead>
+      <tbody id="b-gain20"></tbody>
+    </table></div>
+  </div>
+
+  <!-- 20日跌幅 -->
+  <div class="panel" id="p-lose20">
+    <div class="strip-20d">
+      <span class="strip-label">📅 统计区间</span>
+      <span class="strip-val">""" + date_range_20d + """（过去20个交易日）</span>
+      <span class="strip-label" style="margin-left:12px">🤖 含 AI 趋势深度分析</span>
+    </div>
+    <div class="fbar" id="fb-lose20"></div>
+    <div class="tw"><table id="t-lose20">
+      <thead><tr>
+        <th>#</th><th onclick="srt20('lose20','ticker')">代码</th><th>公司名称</th><th>行业</th>
+        <th onclick="srt20('lose20','price20ago')">20日前</th>
+        <th onclick="srt20('lose20','price')">当前价</th>
+        <th id="th-lose20-chg20" class="sa" onclick="srt20('lose20','chg20')">20日涨跌</th>
+        <th>走势图</th><th>市值</th><th></th>
+      </tr></thead>
+      <tbody id="b-lose20"></tbody>
+    </table></div>
+  </div>
+
 </div>
+
 <div class="footer">
-  数据来源：Yahoo Finance · NewsAPI · Russell 1000 Index &nbsp;|&nbsp;
-  每个交易日盘后（美东 17:30）自动更新 &nbsp;|&nbsp;
+  数据来源：Yahoo Finance · Russell 1000 Index &nbsp;|&nbsp;
+  每个交易日盘后自动更新 &nbsp;|&nbsp;
   仅供参考，不构成投资建议 &nbsp;|&nbsp;
-  分享网址：""" + share + """
+  """ + share + """
 </div>
+
 <script>
-const GAINERS = """ + gjs + """;
-const LOSERS  = """ + ljs + """;
-function sc(s){const m={'Technology':'Technology','Communications':'Communications','Communication Services':'Communication-Services','Financial Services':'Financial-Services','Finance':'Finance','Healthcare':'Healthcare','Health Care':'Health-Care','Energy':'Energy','Consumer Discretionary':'Consumer-Discretionary','Consumer Staples':'Consumer-Staples','Consumer Cyclical':'Consumer-Cyclical','Industrials':'Industrials','Real Estate':'Real-Estate','Materials':'Materials','Basic Materials':'Basic-Materials','Utilities':'Utilities'};return m[s]||'Other';}
-const sortSt={gainers:{col:'chg',asc:false},losers:{col:'chg',asc:true}};
-const sectorFilters={gainers:new Set(),losers:new Set()};
-let searchQ={gainers:'',losers:''};
-function render(key){
-  const data=key==='gainers'?[...GAINERS]:[...LOSERS];
-  const{col,asc}=sortSt[key];
-  data.sort((a,b)=>{let va=a[col],vb=b[col];if(typeof va==='string')va=va.toLowerCase(),vb=vb.toLowerCase();return asc?(va>vb?1:-1):(va<vb?1:-1);});
-  const maxAbs=Math.max(...data.map(d=>Math.abs(d.chg)));
-  const q=searchQ[key].toLowerCase();const sf=sectorFilters[key];
-  const body=document.getElementById('b-'+key);body.innerHTML='';
-  data.forEach((s,i)=>{
-    if(q&&!s.ticker.toLowerCase().includes(q)&&!s.name.toLowerCase().includes(q))return;
-    if(sf.size&&!sf.has(s.sector))return;
-    const isGain=s.chg>=0;const color=isGain?'var(--green)':'var(--red)';
-    const sign=isGain?'+':'';const barW=maxAbs>0?Math.round(Math.abs(s.chg)/maxAbs*100):0;
-    const cls=sc(s.sector);const nid=`n-${key}-${i}`;const rid=`r-${key}-${i}`;
-    const tr=document.createElement('tr');tr.id=rid;
-    tr.innerHTML=`<td class="rk">${s.rank}</td><td><div class="tk">${s.ticker} <span class="arr" id="a-${nid}">▶</span></div></td><td class="nm">${s.name}</td><td><span class="sp-pill ${cls}">${s.sector}</span></td><td class="pc">$${s.price.toFixed(2)}</td><td class="pv">$${s.prev.toFixed(2)}</td><td class="cc ${isGain?'p':'n'}">${sign}${s.chg.toFixed(2)}%</td><td><div class="bb"><div class="bf" style="width:0;background:${color}" data-w="${barW}%"></div></div></td><td class="vc">${s.vol}</td><td class="mc">${s.mktcap}</td><td></td>`;
-    tr.onclick=()=>toggleNews(rid,nid,s,color);body.appendChild(tr);
-    const aiHtml=s.ai?`<div class="ai-box"><div class="ai-label">🤖 AI 异动深度分析</div>${s.ai}</div>`:'';
-    const nr=document.createElement('tr');nr.className='nr';nr.id=nid;nr.style.display='none';
-    nr.innerHTML=`<td colspan="11"><div class="np"><div class="nh">📰 相关新闻 &amp; 异动原因</div>${aiHtml}${s.news.map(n=>`<div class="ni"><div class="nd" style="background:${color}"></div><div><div class="nt">${n.text}</div><div class="ns">${n.src}</div></div></div>`).join('')}</div></td>`;
+// ═══════════════════════════════════════════════════
+// 数据
+// ═══════════════════════════════════════════════════
+const GAINERS  = """ + gjs + """;
+const LOSERS   = """ + ljs + """;
+const GAIN20   = """ + g20js + """;
+const LOSE20   = """ + l20js + """;
+
+// ═══════════════════════════════════════════════════
+// 工具
+// ═══════════════════════════════════════════════════
+function sc(s){
+  const m={
+    'Technology':'Technology','Communications':'Communications',
+    'Communication Services':'Communication-Services',
+    'Financial Services':'Financial-Services','Finance':'Finance',
+    'Healthcare':'Healthcare','Health Care':'Health-Care',
+    'Energy':'Energy',
+    'Consumer Discretionary':'Consumer-Discretionary',
+    'Consumer Cyclical':'Consumer-Cyclical',
+    'Consumer Staples':'Consumer-Staples',
+    'Industrials':'Industrials','Real Estate':'Real-Estate',
+    'Materials':'Materials','Basic Materials':'Basic-Materials',
+    'Utilities':'Utilities'
+  };
+  return m[s]||'Other';
+}
+
+// ── Sparkline ────────────────────────────────────
+function drawSpark(canvas, prices, color) {
+  const W = canvas.width, H = canvas.height;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+  if (!prices || prices.length < 2) return;
+  const mn = Math.min(...prices), mx = Math.max(...prices);
+  const range = mx - mn || 1;
+  const pad = 3;
+  const pts = prices.map((p, i) => [
+    pad + i * (W - 2*pad) / (prices.length - 1),
+    H - pad - (p - mn) / range * (H - 2*pad)
+  ]);
+  // fill
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], H);
+  pts.forEach(([x,y]) => ctx.lineTo(x, y));
+  ctx.lineTo(pts[pts.length-1][0], H);
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0, color + '44');
+  grad.addColorStop(1, color + '00');
+  ctx.fillStyle = grad;
+  ctx.fill();
+  // line
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  pts.slice(1).forEach(([x,y]) => ctx.lineTo(x, y));
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+}
+
+// ═══════════════════════════════════════════════════
+// 今日榜 渲染
+// ═══════════════════════════════════════════════════
+const sortSt = {gainers:{col:'chg',asc:false}, losers:{col:'chg',asc:true}};
+const secFlt  = {gainers:new Set(), losers:new Set()};
+let searchQ   = {gainers:'', losers:''};
+
+function render(key) {
+  const data = key==='gainers' ? [...GAINERS] : [...LOSERS];
+  const {col, asc} = sortSt[key];
+  data.sort((a,b)=>{
+    let va=a[col],vb=b[col];
+    if(typeof va==='string') va=va.toLowerCase(),vb=vb.toLowerCase();
+    return asc?(va>vb?1:-1):(va<vb?1:-1);
+  });
+  const maxAbs = Math.max(...data.map(d=>Math.abs(d.chg)));
+  const q = searchQ[key].toLowerCase();
+  const sf = secFlt[key];
+  const body = document.getElementById('b-'+key);
+  body.innerHTML = '';
+  data.forEach((s, i) => {
+    if(q && !s.ticker.toLowerCase().includes(q) && !s.name.toLowerCase().includes(q)) return;
+    if(sf.size && !sf.has(s.sector)) return;
+    const isGain = s.chg >= 0;
+    const color  = isGain ? 'var(--green)' : 'var(--red)';
+    const sign   = isGain ? '+' : '';
+    const barW   = maxAbs>0 ? Math.round(Math.abs(s.chg)/maxAbs*100) : 0;
+    const cls    = sc(s.sector);
+    const nid    = `n-${key}-${i}`;
+    const rid    = `r-${key}-${i}`;
+    const tr = document.createElement('tr'); tr.id = rid;
+    tr.innerHTML = `
+      <td class="rk">${s.rank}</td>
+      <td><div class="tk">${s.ticker} <span class="arr" id="a-${nid}">▶</span></div></td>
+      <td class="nm">${s.name}</td>
+      <td><span class="sp-pill ${cls}">${s.sector}</span></td>
+      <td class="pc">$${s.price.toFixed(2)}</td>
+      <td class="pv">$${s.prev.toFixed(2)}</td>
+      <td class="cc ${isGain?'p':'n'}">${sign}${s.chg.toFixed(2)}%</td>
+      <td><div class="bb"><div class="bf" style="width:0;background:${color}" data-w="${barW}%"></div></div></td>
+      <td class="vc">${s.vol}</td>
+      <td class="mc">${s.mktcap}</td>
+      <td></td>`;
+    tr.onclick = () => toggleDetail(rid, nid, s, color, 'daily');
+    body.appendChild(tr);
+    const aiHtml = s.ai
+      ? `<div class="ai-box daily"><div class="ai-label daily">🤖 AI 今日异动分析</div>${s.ai}</div>` : '';
+    const nr = document.createElement('tr'); nr.className='nr'; nr.id=nid; nr.style.display='none';
+    nr.innerHTML = `<td colspan="11"><div class="np">
+      <div class="nh">📰 相关新闻 &amp; 异动原因</div>
+      ${aiHtml}
+      ${s.news.map(n=>`<div class="ni"><div class="nd" style="background:${color}"></div>
+        <div><div class="nt">${n.text}</div><div class="ns">${n.src}</div></div></div>`).join('')}
+    </div></td>`;
     body.appendChild(nr);
   });
-  setTimeout(()=>{body.querySelectorAll('.bf').forEach(b=>{b.style.width=b.dataset.w;});},50);
+  setTimeout(()=>{
+    body.querySelectorAll('.bf').forEach(b=>{ b.style.width=b.dataset.w; });
+  }, 50);
 }
-function toggleNews(rid,nid,s,color){
-  const row=document.getElementById(rid);const news=document.getElementById(nid);const arr=document.getElementById('a-'+nid);
-  const open=news.style.display!=='none';news.style.display=open?'none':'table-row';
-  row.classList.toggle('xr',!open);if(arr)arr.style.transform=open?'':'rotate(90deg)';
+
+function toggleDetail(rid, nid, s, color, mode) {
+  const row  = document.getElementById(rid);
+  const det  = document.getElementById(nid);
+  const arr  = document.getElementById('a-'+nid);
+  const open = det.style.display !== 'none';
+  det.style.display = open ? 'none' : 'table-row';
+  row.classList.toggle('xr', !open);
+  if(arr) arr.style.transform = open ? '' : 'rotate(90deg)';
 }
-function srt(key,col){
-  const st=sortSt[key];if(st.col===col)st.asc=!st.asc;else{st.col=col;st.asc=(col==='chg'&&key==='losers');}
+
+function srt(key, col) {
+  const st = sortSt[key];
+  if(st.col===col) st.asc=!st.asc;
+  else { st.col=col; st.asc=(col==='chg'&&key==='losers'); }
   document.querySelectorAll(`#t-${key} thead th`).forEach(th=>th.classList.remove('sa','sd'));
-  const th=document.getElementById(`th-${key}-${col}`);if(th)th.classList.add(st.asc?'sa':'sd');
+  const th = document.getElementById(`th-${key}-${col}`);
+  if(th) th.classList.add(st.asc?'sa':'sd');
   render(key);
 }
-function doSearch(key,val){searchQ[key]=val;render(key);}
-function buildFilters(key){
-  const data=key==='gainers'?GAINERS:LOSERS;
-  const sectors=[...new Set(data.map(d=>d.sector))].sort();
-  const fb=document.getElementById('fb-'+key);
-  fb.innerHTML=`<div class="sw"><input class="fi" placeholder="搜索代码/公司…" oninput="doSearch('${key}',this.value)"></div>`;
-  sectors.forEach(s=>{const chip=document.createElement('span');chip.className='chip';chip.textContent=s;chip.onclick=()=>{const f=sectorFilters[key];if(f.has(s)){f.delete(s);chip.classList.remove('on');}else{f.add(s);chip.classList.add('on');}render(key);};fb.appendChild(chip);});
+
+function doSearch(key, val) { searchQ[key]=val; render(key); }
+
+function buildFilters(key) {
+  const data = key==='gainers' ? GAINERS : LOSERS;
+  const sectors = [...new Set(data.map(d=>d.sector))].sort();
+  const fb = document.getElementById('fb-'+key);
+  fb.innerHTML = `<div class="sw"><input class="fi" placeholder="搜索代码/公司…" oninput="doSearch('${key}',this.value)"></div>`;
+  sectors.forEach(s=>{
+    const chip = document.createElement('span');
+    chip.className='chip'; chip.textContent=s;
+    chip.onclick=()=>{
+      const f=secFlt[key];
+      if(f.has(s)){f.delete(s);chip.classList.remove('on');}
+      else{f.add(s);chip.classList.add('on');}
+      render(key);
+    };
+    fb.appendChild(chip);
+  });
 }
-function buildOverview(){
-  const all=[...GAINERS,...LOSERS];const bySector={};
-  all.forEach(s=>{(bySector[s.sector]=bySector[s.sector]||[]).push(s);});
-  const grid=document.getElementById('ov-grid');
-  grid.innerHTML=Object.entries(bySector).sort(([a],[b])=>a.localeCompare(b)).map(([sector,stocks])=>{
-    const cls=sc(sector);const top=[...stocks].sort((a,b)=>Math.abs(b.chg)-Math.abs(a.chg)).slice(0,6);
-    return`<div class="oc"><div class="oh"><span class="sp-pill ${cls}">${sector}</span><span class="ow">${stocks.length} 只</span></div>${top.map(s=>{const c=s.chg>=0?'var(--green)':'var(--red)';const sign=s.chg>=0?'+':'';return`<div class="om"><span class="ot">${s.ticker}</span><span class="on2">${s.name}</span><span class="oc2" style="color:${c}">${sign}${s.chg.toFixed(2)}%</span></div>`;}).join('')}</div>`;
+
+// ═══════════════════════════════════════════════════
+// 20日榜 渲染
+// ═══════════════════════════════════════════════════
+const sortSt20 = {gain20:{col:'chg20',asc:false}, lose20:{col:'chg20',asc:true}};
+const secFlt20 = {gain20:new Set(), lose20:new Set()};
+let searchQ20  = {gain20:'', lose20:''};
+
+function render20(key) {
+  const data = key==='gain20' ? [...GAIN20] : [...LOSE20];
+  const {col, asc} = sortSt20[key];
+  data.sort((a,b)=>{
+    let va=a[col],vb=b[col];
+    if(typeof va==='string') va=va.toLowerCase(),vb=vb.toLowerCase();
+    return asc?(va>vb?1:-1):(va<vb?1:-1);
+  });
+  const maxAbs = Math.max(...data.map(d=>Math.abs(d.chg20)));
+  const q  = searchQ20[key].toLowerCase();
+  const sf = secFlt20[key];
+  const body = document.getElementById('b-'+key);
+  body.innerHTML = '';
+  const isGainTab = (key==='gain20');
+  data.forEach((s, i) => {
+    if(q && !s.ticker.toLowerCase().includes(q) && !s.name.toLowerCase().includes(q)) return;
+    if(sf.size && !sf.has(s.sector)) return;
+    const isGain = s.chg20 >= 0;
+    const color  = isGain ? '#ffb830' : '#a78bfa';
+    const sign   = isGain ? '+' : '';
+    const cls    = sc(s.sector);
+    const nid    = `n-${key}-${i}`;
+    const rid    = `r-${key}-${i}`;
+    const canId  = `spark-${key}-${i}`;
+    const tr = document.createElement('tr'); tr.id = rid;
+    tr.innerHTML = `
+      <td class="rk">${s.rank}</td>
+      <td><div class="tk">${s.ticker} <span class="arr" id="a-${nid}">▶</span></div></td>
+      <td class="nm">${s.name}</td>
+      <td><span class="sp-pill ${cls}">${s.sector}</span></td>
+      <td class="pv">$${s.price20ago.toFixed(2)}</td>
+      <td class="pc">$${s.price.toFixed(2)}</td>
+      <td class="cc ${isGain?'pa':'na'}">${sign}${s.chg20.toFixed(2)}%</td>
+      <td><div class="spark-wrap"><canvas id="${canId}" width="80" height="28" style="opacity:.9"></canvas></div></td>
+      <td class="mc">${s.mktcap}</td>
+      <td></td>`;
+    tr.onclick = () => toggle20Detail(rid, nid, s, color);
+    body.appendChild(tr);
+    // draw sparkline after DOM append
+    requestAnimationFrame(()=>{
+      const c = document.getElementById(canId);
+      if(c) drawSpark(c, s.prices, color);
+    });
+    const aiHtml = s.ai20
+      ? `<div class="ai-box trend"><div class="ai-label trend">🤖 AI 20日趋势深度分析</div>${s.ai20}</div>` : '';
+    const nr = document.createElement('tr'); nr.className='nr'; nr.id=nid; nr.style.display='none';
+    nr.innerHTML = `<td colspan="10"><div class="np">
+      <div class="nh">📈 20日走势 &amp; AI趋势分析</div>
+      ${aiHtml}
+      ${!s.ai20 ? '<div style="color:var(--muted);font-size:12px">（如需AI分析请配置 OPENAI_API_KEY）</div>' : ''}
+    </div></td>`;
+    body.appendChild(nr);
+  });
+}
+
+function toggle20Detail(rid, nid, s, color) {
+  const row  = document.getElementById(rid);
+  const det  = document.getElementById(nid);
+  const arr  = document.getElementById('a-'+nid);
+  const open = det.style.display !== 'none';
+  det.style.display = open ? 'none' : 'table-row';
+  row.classList.toggle('xr', !open);
+  if(arr) arr.style.transform = open ? '' : 'rotate(90deg)';
+}
+
+function srt20(key, col) {
+  const st = sortSt20[key];
+  if(st.col===col) st.asc=!st.asc;
+  else { st.col=col; st.asc=(col==='chg20'&&key==='lose20'); }
+  document.querySelectorAll(`#t-${key} thead th`).forEach(th=>th.classList.remove('sa','sd'));
+  const th = document.getElementById(`th-${key}-${col}`);
+  if(th) th.classList.add(st.asc?'sa':'sd');
+  render20(key);
+}
+
+function doSearch20(key, val) { searchQ20[key]=val; render20(key); }
+
+function buildFilters20(key) {
+  const data = key==='gain20' ? GAIN20 : LOSE20;
+  const sectors = [...new Set(data.map(d=>d.sector))].sort();
+  const fb = document.getElementById('fb-'+key);
+  fb.innerHTML = `<div class="sw"><input class="fi" placeholder="搜索代码/公司…" oninput="doSearch20('${key}',this.value)"></div>`;
+  sectors.forEach(s=>{
+    const chip = document.createElement('span');
+    chip.className='chip'; chip.textContent=s;
+    chip.onclick=()=>{
+      const f=secFlt20[key];
+      if(f.has(s)){f.delete(s);chip.classList.remove('on');}
+      else{f.add(s);chip.classList.add('on');}
+      render20(key);
+    };
+    fb.appendChild(chip);
+  });
+}
+
+// ═══════════════════════════════════════════════════
+// 行业总览
+// ═══════════════════════════════════════════════════
+function buildOverview() {
+  const all = [...GAINERS, ...LOSERS];
+  const bySector = {};
+  all.forEach(s=>{ (bySector[s.sector]=bySector[s.sector]||[]).push(s); });
+  const grid = document.getElementById('ov-grid');
+  grid.innerHTML = Object.entries(bySector).sort(([a],[b])=>a.localeCompare(b)).map(([sector,stocks])=>{
+    const cls = sc(sector);
+    const top = [...stocks].sort((a,b)=>Math.abs(b.chg)-Math.abs(a.chg)).slice(0,6);
+    return `<div class="oc">
+      <div class="oh"><span class="sp-pill ${cls}">${sector}</span><span class="ow">${stocks.length} 只</span></div>
+      ${top.map(s=>{
+        const c=s.chg>=0?'var(--green)':'var(--red)';
+        const sign=s.chg>=0?'+':'';
+        return `<div class="om"><span class="ot">${s.ticker}</span><span class="on2">${s.name}</span>
+          <span class="oc2" style="color:${c}">${sign}${s.chg.toFixed(2)}%</span></div>`;
+      }).join('')}
+    </div>`;
   }).join('');
 }
-function sw(key,el){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('on'));el.classList.add('on');document.getElementById('p-'+key).classList.add('on');}
-function updateTime(){const now=new Date();const et=now.toLocaleString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});document.getElementById('lt').textContent=et+' ET';}
-buildFilters('gainers');buildFilters('losers');render('gainers');render('losers');buildOverview();updateTime();setInterval(updateTime,1000);
+
+// ═══════════════════════════════════════════════════
+// Tab 切换
+// ═══════════════════════════════════════════════════
+function sw(key, el) {
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('on'));
+  el.classList.add('on');
+  document.getElementById('p-'+key).classList.add('on');
+}
+
+// ═══════════════════════════════════════════════════
+// 时钟
+// ═══════════════════════════════════════════════════
+function updateTime() {
+  const et = new Date().toLocaleString('en-US',{timeZone:'America/New_York',
+    hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
+  document.getElementById('lt').textContent = et + ' ET';
+}
+
+// ═══════════════════════════════════════════════════
+// 初始化
+// ═══════════════════════════════════════════════════
+buildFilters('gainers'); buildFilters('losers');
+render('gainers'); render('losers'); buildOverview();
+buildFilters20('gain20'); buildFilters20('lose20');
+render20('gain20'); render20('lose20');
+updateTime(); setInterval(updateTime, 1000);
 </script>
 </body>
 </html>"""
 
-
-# ── 发送邮件 ──────────────────────────────────────────────────
+# ────────────────────────────────────────────────
 def send_email(subject, body_html):
     if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
-        print("⚠️ 邮件配置缺失，跳过发送")
-        return
+        print("⚠️ 邮件配置缺失，跳过"); return
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = EMAIL_FROM
-    msg["To"]      = EMAIL_TO
-    msg.attach(MIMEText(body_html, "html", "utf-8"))
+    msg["Subject"]=subject; msg["From"]=EMAIL_FROM; msg["To"]=EMAIL_TO
+    msg.attach(MIMEText(body_html,"html","utf-8"))
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
         s.login(EMAIL_FROM, EMAIL_PASSWORD)
         s.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
@@ -598,19 +988,17 @@ def email_body(gainers, losers, report_date, pages_url):
 <h1 style="font-size:20px;color:#fff">美股异动日报 {report_date}</h1>
 <table style="width:100%;margin:16px 0"><tr>
 <td style="width:50%;vertical-align:top;padding-right:8px">
-  <div style="font-size:10px;color:#5a6a7a;margin-bottom:8px">▲ 涨幅 TOP 5</div>
-  <table style="width:100%;border-collapse:collapse">{top3g}</table>
-</td>
+<div style="font-size:10px;color:#5a6a7a;margin-bottom:8px">▲ 今日涨幅 TOP 5</div>
+<table style="width:100%;border-collapse:collapse">{top3g}</table></td>
 <td style="width:50%;vertical-align:top;padding-left:8px">
-  <div style="font-size:10px;color:#5a6a7a;margin-bottom:8px">▼ 跌幅 TOP 5</div>
-  <table style="width:100%;border-collapse:collapse">{top3l}</table>
-</td></tr></table>
+<div style="font-size:10px;color:#5a6a7a;margin-bottom:8px">▼ 今日跌幅 TOP 5</div>
+<table style="width:100%;border-collapse:collapse">{top3l}</table></td>
+</tr></table>
 <div style="text-align:center;padding:12px">{link}</div>
 <div style="font-size:10px;color:#3a4a5a;text-align:center">仅供参考，不构成投资建议</div>
 </div></body></html>"""
 
-
-# ── 主流程 ────────────────────────────────────────────────────
+# ────────────────────────────────────────────────
 def main():
     print("="*60)
     print(f"🚀 罗素1000 监控启动 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
@@ -619,56 +1007,86 @@ def main():
     tickers = get_tickers()
     print(f"  成分股: {len(tickers)} 只")
 
+    # ── 今日行情 ──────────────────────────────────
     perf = fetch_perf(tickers)
     if not perf:
-        print("❌ 未能获取任何行情数据，退出。")
-        return
-
+        print("❌ 未能获取今日行情，退出"); return
     perf = [x for x in perf if abs(x["chg"]) <= 100]
-    print(f"\n✅ 有效数据: {len(perf)} 只")
+    print(f"  今日有效: {len(perf)} 只")
     if len(perf) < 10:
-        print(f"⚠️ 有效数据仅 {len(perf)} 只，数据不足，退出")
-        return
+        print("⚠️ 数据不足，退出"); return
 
     perf.sort(key=lambda x: x["chg"], reverse=True)
-    n = min(TOP_N, len(perf) // 2)
+    n = min(TOP_N, len(perf)//2)
     gainers_raw = perf[:n]
     losers_raw  = list(reversed(perf[-n:]))
+    print(f"\n  今日涨冠: {gainers_raw[0]['ticker']} +{gainers_raw[0]['chg']}%")
+    print(f"  今日跌冠: {losers_raw[0]['ticker']}  {losers_raw[0]['chg']}%")
 
-    print(f"\n  涨幅榜首: {gainers_raw[0]['ticker']} +{gainers_raw[0]['chg']}%")
-    print(f"  跌幅榜首: {losers_raw[0]['ticker']} {losers_raw[0]['chg']}%")
+    # ── 20日行情 ──────────────────────────────────
+    perf_20d = fetch_perf_20d(tickers)
+    perf_20d = [x for x in perf_20d if abs(x["chg_20d"]) <= 200]
+    print(f"  20日有效: {len(perf_20d)} 只")
+    perf_20d.sort(key=lambda x: x["chg_20d"], reverse=True)
+    n20 = min(TOP_N, len(perf_20d)//2)
+    gainers_20d_raw = perf_20d[:n20]
+    losers_20d_raw  = list(reversed(perf_20d[-n20:]))
+    if gainers_20d_raw:
+        print(f"  20日涨冠: {gainers_20d_raw[0]['ticker']} +{gainers_20d_raw[0]['chg_20d']}%")
+    if losers_20d_raw:
+        print(f"  20日跌冠: {losers_20d_raw[0]['ticker']}  {losers_20d_raw[0]['chg_20d']}%")
 
-    def enrich(stocks):
+    # ── 计算日期范围 ──────────────────────────────
+    now = datetime.utcnow()
+    date_start = (now - timedelta(days=30)).strftime("%m/%d")
+    date_end   = now.strftime("%m/%d")
+    date_range_20d = f"{date_start} – {date_end}"
+
+    # ── 丰富今日数据 ──────────────────────────────
+    def enrich_daily(stocks):
         out = []
         for i, s in enumerate(stocks):
             info = get_info(s["ticker"])
-            print(f"  [{i+1}/{len(stocks)}] {s['ticker']} ({s['chg']:+.2f}%) 处理中...")
+            print(f"  [{i+1}/{len(stocks)}] {s['ticker']} ({s['chg']:+.2f}%) 日报处理...")
             news = fetch_news(s["ticker"], info["name"])
-            # ★ 关键改进：把新闻传给AI，让AI结合新闻做深度分析
-            ai = gpt_analysis(
-                ticker=s["ticker"],
-                name=info["name"],
-                chg=s["chg"],
-                sector=info["sector"],
-                industry=info["industry"],
-                mktcap=info["mktcap"],
-                vol=s["vol"],
-                price=s["price"],
-                news_items=news
-            )
-            out.append({**s, "rank": i+1, "info": info, "news": news, "ai": ai})
+            ai   = gpt_analysis_daily(
+                ticker=s["ticker"], name=info["name"], chg=s["chg"],
+                sector=info["sector"], industry=info["industry"],
+                mktcap=info["mktcap"], vol=s["vol"], price=s["price"],
+                news_items=news)
+            out.append({**s, "rank":i+1, "info":info, "news":news, "ai":ai})
+            time.sleep(0.4)
+        return out
+
+    # ── 丰富20日数据 ──────────────────────────────
+    def enrich_20d(stocks):
+        out = []
+        for i, s in enumerate(stocks):
+            info = get_info(s["ticker"])
+            print(f"  [{i+1}/{len(stocks)}] {s['ticker']} ({s['chg_20d']:+.2f}%) 20日分析...")
+            ai20 = gpt_analysis_20d(
+                ticker=s["ticker"], name=info["name"], chg_20d=s["chg_20d"],
+                sector=info["sector"], industry=info["industry"],
+                price_now=s["price"], price_20d_ago=s["price_20d_ago"],
+                date_range=date_range_20d)
+            out.append({**s, "rank":i+1, "info":info, "ai20":ai20})
             time.sleep(0.5)
         return out
 
-    print("\n📈 处理涨幅榜...")
-    gainers = enrich(gainers_raw)
-    print("\n📉 处理跌幅榜...")
-    losers  = enrich(losers_raw)
+    print("\n📈 今日涨幅榜处理...")
+    gainers = enrich_daily(gainers_raw)
+    print("\n📉 今日跌幅榜处理...")
+    losers  = enrich_daily(losers_raw)
+    print("\n📈 20日涨幅榜处理...")
+    gainers_20d = enrich_20d(gainers_20d_raw)
+    print("\n📉 20日跌幅榜处理...")
+    losers_20d  = enrich_20d(losers_20d_raw)
 
-    now = datetime.utcnow()
+    # ── 生成 HTML ────────────────────────────────
     report_date  = now.strftime("%Y年%m月%d日")
     generated_at = now.strftime("%Y-%m-%d %H:%M")
-    html = build_html(gainers, losers, report_date, generated_at, len(perf))
+    html = build_html(gainers, losers, gainers_20d, losers_20d,
+                      report_date, generated_at, len(perf), date_range_20d)
 
     os.makedirs("docs", exist_ok=True)
     with open("docs/index.html", "w", encoding="utf-8") as f:
