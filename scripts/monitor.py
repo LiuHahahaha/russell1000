@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-罗素1000 美股异动日报 — 完整版
+罗素1000 美股异动日报 — 完整版（AI分析增强版）
 每日盘后由 GitHub Actions 自动运行：
 1. 获取罗素1000成分股列表
 2. 批量下载当日行情，找出涨幅前30 / 跌幅前30
 3. 为每只股票抓取最新新闻标题（原因）
-4. 把真实数据注入 HTML 模板 → docs/index.html
-5. GitHub Actions 推送到 GitHub Pages（固定网址）
-6. 同时发送邮件通知
+4. 把新闻+行情传给AI做深度分析
+5. 把真实数据注入 HTML 模板 → docs/index.html
+6. GitHub Actions 推送到 GitHub Pages（固定网址）
+7. 同时发送邮件通知
 """
+
 import os, json, time, re, smtplib
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+
 import yfinance as yf
 import pandas as pd
 import requests
@@ -77,21 +80,19 @@ def get_tickers():
     print(f"  ⚠️ 兜底列表: {len(FALLBACK)} 只")
     return list(dict.fromkeys(FALLBACK))
 
+
 # ── 批量拉行情（核心修复版）─────────────────────────────────────
 def fetch_perf(tickers, batch=100):
     print(f"\n📊 下载行情 ({len(tickers)} 只)...")
     out = []
     groups = [tickers[i:i+batch] for i in range(0, len(tickers), batch)]
-
     for gi, chunk in enumerate(groups):
         try:
             raw = yf.download(chunk, period="5d", interval="1d",
                               auto_adjust=True, progress=False, threads=True)
             if raw.empty:
                 raise ValueError("empty dataframe")
-
             if len(chunk) == 1:
-                # 单只股票：columns 是 ['Close','High','Low','Open','Volume']
                 t = chunk[0]
                 try:
                     cl = raw["Close"].dropna()
@@ -99,13 +100,13 @@ def fetch_perf(tickers, batch=100):
                     if len(cl) >= 2:
                         p0, p1 = float(cl.iloc[-2]), float(cl.iloc[-1])
                         if p0 > 0 and p1 > 0:
-                            out.append({"ticker": t, "price": round(p1, 2), "prev": round(p0, 2),
+                            out.append({"ticker": t, "price": round(p1, 2),
+                                        "prev": round(p0, 2),
                                         "chg": round((p1-p0)/p0*100, 2),
                                         "vol": int(vo.iloc[-1]) if len(vo) else 0})
                 except Exception as e:
                     pass
             else:
-                # 多只股票：MultiIndex columns (metric, ticker)
                 close_df = raw["Close"] if "Close" in raw.columns.get_level_values(0) else None
                 vol_df   = raw["Volume"] if "Volume" in raw.columns.get_level_values(0) else None
                 if close_df is None:
@@ -119,18 +120,17 @@ def fetch_perf(tickers, batch=100):
                         if len(cl) >= 2:
                             p0, p1 = float(cl.iloc[-2]), float(cl.iloc[-1])
                             if p0 > 0 and p1 > 0:
-                                out.append({"ticker": t, "price": round(p1, 2), "prev": round(p0, 2),
+                                out.append({"ticker": t, "price": round(p1, 2),
+                                            "prev": round(p0, 2),
                                             "chg": round((p1-p0)/p0*100, 2),
                                             "vol": int(vo.iloc[-1]) if len(vo) else 0})
                     except:
                         pass
         except Exception as e:
             print(f"  ⚠️ batch {gi+1} 批量下载失败: {e}")
-
         print(f"  batch {gi+1}/{len(groups)} 完成 → 累计 {len(out)} 只")
         time.sleep(0.3)
 
-    # ── Fallback：逐只下载（当批量全部失败时）────────────────
     if len(out) < 20:
         print(f"  ⚠️ 批量下载仅得到 {len(out)} 只，改用逐只下载...")
         out2 = []
@@ -142,8 +142,10 @@ def fetch_perf(tickers, batch=100):
                     p1 = float(hist["Close"].iloc[-1])
                     if p0 > 0 and p1 > 0:
                         vol = int(hist["Volume"].iloc[-1]) if "Volume" in hist.columns else 0
-                        out2.append({"ticker": t, "price": round(p1, 2), "prev": round(p0, 2),
-                                     "chg": round((p1-p0)/p0*100, 2), "vol": vol})
+                        out2.append({"ticker": t, "price": round(p1, 2),
+                                     "prev": round(p0, 2),
+                                     "chg": round((p1-p0)/p0*100, 2),
+                                     "vol": vol})
             except:
                 pass
             if i % 100 == 99:
@@ -152,6 +154,7 @@ def fetch_perf(tickers, batch=100):
         if len(out2) > len(out):
             out = out2
     return out
+
 
 # ── 公司基本信息 ─────────────────────────────────────────────
 _info_cache = {}
@@ -172,7 +175,7 @@ def get_info(ticker):
 def fmt_cap(n):
     if not n: return "N/A"
     if n>=1e12: return f"${n/1e12:.2f}T"
-    if n>=1e9:  return f"${n/1e9:.1f}B"
+    if n>=1e9: return f"${n/1e9:.1f}B"
     return f"${n/1e6:.0f}M"
 
 def fmt_vol(v):
@@ -182,26 +185,6 @@ def fmt_vol(v):
     if v>=1e3: return f"{v/1e3:.0f}K"
     return str(v)
 
-# ── GPT AI 分析 ─────────────────────────────────────────────
-def gpt_analysis(ticker, name, chg, sector):
-    """用 GPT-4o-mini 生成中文股票异动原因分析"""
-    if not OPENAI_API_KEY:
-        return None
-    direction = "大涨" if chg > 0 else "大跌"
-    prompt = (f"{name}（{ticker}）今日{direction} {abs(chg):.1f}%，所属行业：{sector}。"
-              f"请用中文简要分析可能的原因（2-3句话，不要编造具体新闻，基于行业逻辑和常见驱动因素分析）。")
-    try:
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
-                     "Content-Type": "application/json"},
-            json={"model": "gpt-4o-mini", "max_tokens": 200, "temperature": 0.7,
-                  "messages": [{"role": "user", "content": prompt}]},
-            timeout=15
-        )
-        return r.json()["choices"][0]["message"]["content"].strip()
-    except:
-        return None
 
 # ── 抓新闻 ───────────────────────────────────────────────────
 def fetch_news(ticker, name):
@@ -210,7 +193,8 @@ def fetch_news(ticker, name):
         try:
             p = {"q": f'"{ticker}" stock',
                  "from": (datetime.utcnow()-timedelta(days=2)).strftime("%Y-%m-%d"),
-                 "sortBy":"relevancy","pageSize":5,"language":"en","apiKey":NEWS_API_KEY}
+                 "sortBy":"relevancy","pageSize":5,"language":"en",
+                 "apiKey":NEWS_API_KEY}
             r = requests.get("https://newsapi.org/v2/everything", params=p, timeout=10)
             for a in r.json().get("articles",[])[:5]:
                 t = (a.get("title") or "").strip()
@@ -218,7 +202,8 @@ def fetch_news(ticker, name):
                 d = (a.get("publishedAt") or "")[:10]
                 if t and "[Removed]" not in t:
                     items.append({"text":t,"src":f"{s} · {d}"})
-        except: pass
+        except:
+            pass
     if not items:
         try:
             url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
@@ -229,10 +214,83 @@ def fetch_news(ticker, name):
                 pub = (item.findtext("pubDate") or "")[:16]
                 if t:
                     items.append({"text":t,"src":f"Yahoo Finance · {pub}"})
-        except: pass
+        except:
+            pass
     if not items:
         items = [{"text":"暂无最新新闻，可能为技术性波动或市场整体情绪驱动","src":"—"}]
     return items[:5]
+
+
+# ══════════════════════════════════════════════════════════════
+# ── GPT AI 深度分析（增强版）─────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+def gpt_analysis(ticker, name, chg, sector, industry, mktcap, vol, price, news_items):
+    """用 GPT-4o-mini 生成中文股票异动深度分析，结合新闻内容"""
+    if not OPENAI_API_KEY:
+        return None
+
+    direction = "大涨" if chg > 0 else "大跌"
+    cap_str = fmt_cap(mktcap)
+    vol_str = fmt_vol(vol)
+
+    # 把抓到的新闻标题整理成文本，传给AI参考
+    news_text = ""
+    for i, n in enumerate(news_items, 1):
+        if n["text"] != "暂无最新新闻，可能为技术性波动或市场整体情绪驱动":
+            news_text += f"  {i}. {n['text']} ({n['src']})\n"
+
+    if not news_text:
+        news_text = "  （暂无相关新闻）\n"
+
+    prompt = f"""你是一位资深的美股分析师，擅长解读股价异动原因。请根据以下信息，对这只股票今日的异常波动进行深度分析。
+
+【股票信息】
+- 公司：{name}（{ticker}）
+- 行业：{sector} / {industry}
+- 市值：{cap_str}
+- 当前价：${price}
+- 今日涨跌幅：{'+' if chg > 0 else ''}{chg:.2f}%
+- 成交量：{vol_str}
+
+【今日相关新闻标题】
+{news_text}
+【分析要求】
+请用中文撰写一段详细的异动分析（150-250字），包含以下要素：
+1. 核心驱动因素：结合上面的新闻标题，分析最可能导致{direction}的直接原因
+2. 行业背景：当前{sector}行业的大环境如何影响该股
+3. 资金面解读：从成交量和市值角度分析市场情绪
+4. 后续关注点：投资者接下来应关注什么催化剂或风险
+
+要求：
+- 分析要具体、有深度，不要泛泛而谈
+- 如果新闻标题中有明确的事件（如财报、收购、产品发布、指数调整等），务必作为核心原因展开分析
+- 如果没有明确新闻，则基于行业逻辑和市场环境合理推断
+- 不要使用编号或列表格式，用自然流畅的段落表达
+- 不要加标题或前缀，直接输出分析内容"""
+
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={
+                "model": "gpt-4o-mini",
+                "max_tokens": 600,
+                "temperature": 0.7,
+                "messages": [
+                    {"role": "system", "content": "你是一位专业的美股市场分析师，擅长结合新闻事件、行业趋势和资金面数据来解读个股异动。你的分析风格专业但通俗易懂，善于抓住核心逻辑。"},
+                    {"role": "user", "content": prompt}
+                ]
+            },
+            timeout=30
+        )
+        result = r.json()["choices"][0]["message"]["content"].strip()
+        print(f"    ✅ AI分析完成 ({len(result)} 字)")
+        return result
+    except Exception as e:
+        print(f"    ⚠️ AI分析失败: {e}")
+        return None
+
 
 # ── 数据序列化为 JS ──────────────────────────────────────────
 def to_js(stocks):
@@ -259,11 +317,13 @@ def to_js(stocks):
             +",news:"+news+"}")
     return "[\n"+",\n".join(rows)+"\n]"
 
-# ── 生成 HTML（与之前相同，此处省略完整模板）────────────────
+
+# ── 生成 HTML ────────────────────────────────────────────────
 def build_html(gainers, losers, report_date, generated_at, total):
     gjs = to_js(gainers)
     ljs = to_js(losers)
     share = f'<a href="{PAGES_URL}" style="color:var(--blue)">{PAGES_URL}</a>' if PAGES_URL else "GitHub Pages"
+
     return """<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -337,8 +397,9 @@ tbody td{padding:9px 10px;vertical-align:middle;white-space:nowrap;}
 .np{padding:14px 58px 18px;background:var(--surface);border-left:2px solid var(--border2);}
 .nh{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--muted);margin-bottom:10px;display:flex;align-items:center;gap:8px;}
 .nh::after{content:'';flex:1;height:1px;background:var(--border);}
-.ai-box{background:rgba(61,158,255,.07);border:1px solid rgba(61,158,255,.2);border-radius:4px;padding:10px 14px;margin-bottom:12px;font-size:12px;color:var(--text);line-height:1.7;}
-.ai-label{font-family:var(--mono);font-size:9px;color:var(--blue);letter-spacing:1px;margin-bottom:4px;}
+.ai-box{background:rgba(61,158,255,.07);border:1px solid rgba(61,158,255,.2);border-radius:4px;padding:14px 18px;margin-bottom:14px;font-size:13px;color:var(--text);line-height:1.85;}
+.ai-label{font-family:var(--mono);font-size:9px;color:var(--blue);letter-spacing:1px;margin-bottom:6px;display:flex;align-items:center;gap:6px;}
+.ai-label::after{content:'';flex:1;height:1px;background:rgba(61,158,255,.15);}
 .ni{display:flex;gap:10px;padding:6px 0;border-bottom:1px solid rgba(30,40,48,.4);align-items:flex-start;}
 .ni:last-child{border-bottom:none;}
 .nd{width:4px;height:4px;border-radius:50%;margin-top:7px;flex-shrink:0;}
@@ -351,9 +412,10 @@ tbody td{padding:9px 10px;vertical-align:middle;white-space:nowrap;}
 .Energy{background:rgba(255,140,0,.10);color:#ff8c00;}
 .Consumer-Discretionary{background:rgba(180,120,255,.10);color:#b478ff;}
 .Consumer-Staples{background:rgba(220,160,80,.10);color:#dca050;}
+.Consumer-Cyclical{background:rgba(180,120,255,.10);color:#b478ff;}
 .Industrials{background:rgba(90,160,160,.10);color:#5aa0a0;}
 .Real-Estate{background:rgba(255,100,80,.10);color:#ff6450;}
-.Materials{background:rgba(100,200,100,.10);color:#64c864;}
+.Materials,.Basic-Materials{background:rgba(100,200,100,.10);color:#64c864;}
 .Utilities{background:rgba(200,180,100,.10);color:#c8b464;}
 .Other{background:rgba(100,100,100,.10);color:#888;}
 .og{display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));gap:12px;}
@@ -400,8 +462,8 @@ tbody td{padding:9px 10px;vertical-align:middle;white-space:nowrap;}
 </div>
 <div class="tabs">
   <div class="tab ga on" onclick="sw('gainers',this)">涨幅榜 <span class="badge">TOP """ + str(TOP_N) + """</span></div>
-  <div class="tab lo"    onclick="sw('losers',this)" >跌幅榜 <span class="badge">TOP """ + str(TOP_N) + """</span></div>
-  <div class="tab ov"    onclick="sw('overview',this)">行业总览</div>
+  <div class="tab lo" onclick="sw('losers',this)" >跌幅榜 <span class="badge">TOP """ + str(TOP_N) + """</span></div>
+  <div class="tab ov" onclick="sw('overview',this)">行业总览</div>
 </div>
 <div class="main">
   <div class="panel on" id="p-gainers">
@@ -441,7 +503,7 @@ tbody td{padding:9px 10px;vertical-align:middle;white-space:nowrap;}
 <script>
 const GAINERS = """ + gjs + """;
 const LOSERS  = """ + ljs + """;
-function sc(s){const m={'Technology':'Technology','Communications':'Communications','Communication Services':'Communication-Services','Financial Services':'Financial-Services','Finance':'Finance','Healthcare':'Healthcare','Health Care':'Health-Care','Energy':'Energy','Consumer Discretionary':'Consumer-Discretionary','Consumer Staples':'Consumer-Staples','Industrials':'Industrials','Real Estate':'Real-Estate','Materials':'Materials','Utilities':'Utilities'};return m[s]||'Other';}
+function sc(s){const m={'Technology':'Technology','Communications':'Communications','Communication Services':'Communication-Services','Financial Services':'Financial-Services','Finance':'Finance','Healthcare':'Healthcare','Health Care':'Health-Care','Energy':'Energy','Consumer Discretionary':'Consumer-Discretionary','Consumer Staples':'Consumer-Staples','Consumer Cyclical':'Consumer-Cyclical','Industrials':'Industrials','Real Estate':'Real-Estate','Materials':'Materials','Basic Materials':'Basic-Materials','Utilities':'Utilities'};return m[s]||'Other';}
 const sortSt={gainers:{col:'chg',asc:false},losers:{col:'chg',asc:true}};
 const sectorFilters={gainers:new Set(),losers:new Set()};
 let searchQ={gainers:'',losers:''};
@@ -461,7 +523,7 @@ function render(key){
     const tr=document.createElement('tr');tr.id=rid;
     tr.innerHTML=`<td class="rk">${s.rank}</td><td><div class="tk">${s.ticker} <span class="arr" id="a-${nid}">▶</span></div></td><td class="nm">${s.name}</td><td><span class="sp-pill ${cls}">${s.sector}</span></td><td class="pc">$${s.price.toFixed(2)}</td><td class="pv">$${s.prev.toFixed(2)}</td><td class="cc ${isGain?'p':'n'}">${sign}${s.chg.toFixed(2)}%</td><td><div class="bb"><div class="bf" style="width:0;background:${color}" data-w="${barW}%"></div></div></td><td class="vc">${s.vol}</td><td class="mc">${s.mktcap}</td><td></td>`;
     tr.onclick=()=>toggleNews(rid,nid,s,color);body.appendChild(tr);
-    const aiHtml=s.ai?`<div class="ai-box"><div class="ai-label">🤖 AI 异动分析</div>${s.ai}</div>`:'';
+    const aiHtml=s.ai?`<div class="ai-box"><div class="ai-label">🤖 AI 异动深度分析</div>${s.ai}</div>`:'';
     const nr=document.createElement('tr');nr.className='nr';nr.id=nid;nr.style.display='none';
     nr.innerHTML=`<td colspan="11"><div class="np"><div class="nh">📰 相关新闻 &amp; 异动原因</div>${aiHtml}${s.news.map(n=>`<div class="ni"><div class="nd" style="background:${color}"></div><div><div class="nt">${n.text}</div><div class="ns">${n.src}</div></div></div>`).join('')}</div></td>`;
     body.appendChild(nr);
@@ -503,6 +565,7 @@ buildFilters('gainers');buildFilters('losers');render('gainers');render('losers'
 </body>
 </html>"""
 
+
 # ── 发送邮件 ──────────────────────────────────────────────────
 def send_email(subject, body_html):
     if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
@@ -535,16 +598,17 @@ def email_body(gainers, losers, report_date, pages_url):
 <h1 style="font-size:20px;color:#fff">美股异动日报 {report_date}</h1>
 <table style="width:100%;margin:16px 0"><tr>
 <td style="width:50%;vertical-align:top;padding-right:8px">
-<div style="font-size:10px;color:#5a6a7a;margin-bottom:8px">▲ 涨幅 TOP 5</div>
-<table style="width:100%;border-collapse:collapse">{top3g}</table>
+  <div style="font-size:10px;color:#5a6a7a;margin-bottom:8px">▲ 涨幅 TOP 5</div>
+  <table style="width:100%;border-collapse:collapse">{top3g}</table>
 </td>
 <td style="width:50%;vertical-align:top;padding-left:8px">
-<div style="font-size:10px;color:#5a6a7a;margin-bottom:8px">▼ 跌幅 TOP 5</div>
-<table style="width:100%;border-collapse:collapse">{top3l}</table>
+  <div style="font-size:10px;color:#5a6a7a;margin-bottom:8px">▼ 跌幅 TOP 5</div>
+  <table style="width:100%;border-collapse:collapse">{top3l}</table>
 </td></tr></table>
 <div style="text-align:center;padding:12px">{link}</div>
 <div style="font-size:10px;color:#3a4a5a;text-align:center">仅供参考，不构成投资建议</div>
 </div></body></html>"""
+
 
 # ── 主流程 ────────────────────────────────────────────────────
 def main():
@@ -562,7 +626,6 @@ def main():
 
     perf = [x for x in perf if abs(x["chg"]) <= 100]
     print(f"\n✅ 有效数据: {len(perf)} 只")
-
     if len(perf) < 10:
         print(f"⚠️ 有效数据仅 {len(perf)} 只，数据不足，退出")
         return
@@ -573,7 +636,7 @@ def main():
     losers_raw  = list(reversed(perf[-n:]))
 
     print(f"\n  涨幅榜首: {gainers_raw[0]['ticker']} +{gainers_raw[0]['chg']}%")
-    print(f"  跌幅榜首: {losers_raw[0]['ticker']}  {losers_raw[0]['chg']}%")
+    print(f"  跌幅榜首: {losers_raw[0]['ticker']} {losers_raw[0]['chg']}%")
 
     def enrich(stocks):
         out = []
@@ -581,9 +644,20 @@ def main():
             info = get_info(s["ticker"])
             print(f"  [{i+1}/{len(stocks)}] {s['ticker']} ({s['chg']:+.2f}%) 处理中...")
             news = fetch_news(s["ticker"], info["name"])
-            ai   = gpt_analysis(s["ticker"], info["name"], s["chg"], info["sector"])
+            # ★ 关键改进：把新闻传给AI，让AI结合新闻做深度分析
+            ai = gpt_analysis(
+                ticker=s["ticker"],
+                name=info["name"],
+                chg=s["chg"],
+                sector=info["sector"],
+                industry=info["industry"],
+                mktcap=info["mktcap"],
+                vol=s["vol"],
+                price=s["price"],
+                news_items=news
+            )
             out.append({**s, "rank": i+1, "info": info, "news": news, "ai": ai})
-            time.sleep(0.3)
+            time.sleep(0.5)
         return out
 
     print("\n📈 处理涨幅榜...")
