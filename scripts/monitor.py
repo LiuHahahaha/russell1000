@@ -349,7 +349,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .chip{background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:4px 10px;font-size:10px;border-radius:3px;cursor:pointer;transition:all .2s;user-select:none;font-family:var(--mono);}.chip:hover,.chip.on{border-color:var(--border2);color:var(--text);background:var(--surface2);}
 .tw{overflow-x:auto;}
 table{width:100%;border-collapse:collapse;font-size:12px;}
-thead th{background:var(--surface);border-bottom:1px solid var(--border);padding:7px 10px;text-align:left;font-family:var(--mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);white-space:nowrap;position:sticky;top:48px;cursor:pointer;user-select:none;}
+thead th{background:var(--surface);border-bottom:1px solid var(--border);padding:7px 10px;text-align:left;font-family:var(--mono);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted);white-space:nowrap;position:sticky;top:48px;z-index:10;cursor:pointer;user-select:none;}
 thead th:hover{color:var(--text);}thead th.sa::after{content:' ↑';color:var(--amber);}thead th.sd::after{content:' ↓';color:var(--amber);}
 tbody tr{border-bottom:1px solid rgba(30,40,48,.7);transition:background .1s;cursor:pointer;}tbody tr:hover{background:var(--surface2);}tbody tr.xr{background:var(--surface2);}
 tbody td{padding:9px 10px;vertical-align:middle;white-space:nowrap;}
