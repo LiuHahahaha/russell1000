@@ -420,13 +420,25 @@ buildFilters('gainers');buildFilters('losers');render('gainers');render('losers'
 
 def send_email(subject, body_html):
     if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
-        print("⚠️ 邮件配置缺失，跳过"); return
-    msg = MIMEMultipart("alternative")
-    msg["Subject"]=subject; msg["From"]=EMAIL_FROM; msg["To"]=EMAIL_TO
-    msg.attach(MIMEText(body_html,"html","utf-8"))
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
-        s.login(EMAIL_FROM, EMAIL_PASSWORD); s.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-    print(f"✅ 邮件已发送 → {EMAIL_TO}")
+        print("⚠️ 邮件配置缺失，跳过")
+        return
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+        msg.attach(MIMEText(body_html, "html", "utf-8"))
+
+        # 固定使用 465 端口，完全避免 connect() 错误
+        server = smtplib.SMTP_SSL(SMTP_HOST, 465)
+        server.login(EMAIL_FROM, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        server.quit()
+
+        print(f"✅ 邮件已发送 → {EMAIL_TO}")
+    except Exception as e:
+        print(f"❌ 邮件发送失败，但继续执行流程: {str(e)}")
 
 def email_body(gainers, losers, report_date, pages_url):
     top3g = "".join(f'<tr><td style="padding:6px 12px;font-family:monospace;color:#00e5a0;font-weight:700">{s["ticker"]}</td><td style="padding:6px 12px;color:#d4dde8">{s["info"]["name"]}</td><td style="padding:6px 12px;font-family:monospace;color:#00e5a0;font-weight:700">+{s["chg"]:.2f}%</td></tr>' for s in gainers[:5])
